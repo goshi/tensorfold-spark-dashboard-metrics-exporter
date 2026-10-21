@@ -1,0 +1,13 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+
+# Local backups
+*.bak*
+
+# Runtime data (local to the deployment node, not part of the source)
+data/
+runs/
+
+# Local environment overrides
+.env

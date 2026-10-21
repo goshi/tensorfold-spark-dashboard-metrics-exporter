@@ -1,0 +1,16 @@
+[Unit]
+Description=TensorFold -> vLLM metrics bridge for Spark Dashboard (DeepSeek pair)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+Environment=TF_UPSTREAM=http://localhost:8002
+Environment=TF_PORT=8004
+Environment=TF_BIND=0.0.0.0
+Environment=TF_POLL_INTERVAL=2
+WorkingDirectory=/home/admin/llm/tensorfold-metrics-exporter
+ExecStart=/usr/bin/python3 /home/admin/llm/tensorfold-metrics-exporter/exporter.py
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
