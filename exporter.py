@@ -7,7 +7,7 @@ TensorFold /metrics endpoint, rewrites the families into vLLM-named
 equivalents and serves the result on its own port. Any other GET path is
 proxied to the upstream unchanged.
 
-Supports TWO upstream engine profiles (auto-detected per poll):
+Supports THREE upstream engine profiles (auto-detected per poll):
 
   * "health" profile (older TensorFold, e.g. the GLM pair): exposes
     `tensorfold_health:*` counters. The live completion counter feeds
@@ -28,6 +28,16 @@ Supports TWO upstream engine profiles (auto-detected per poll):
         corrupting totals. Point Live/throughput panels at the
         tfexporter_live_* gauges; keep rate() on the vllm_* counters for real
         token totals (completion bursts are real).
+
+  * "vllm" profile (a native vLLM engine, e.g. the exlr8 GLM build): the
+    upstream already serves REAL `vllm:*` families (TTFT/E2E/ITL/TPOT
+    histograms, KV-cache usage, prefix-cache and spec-decode counters).
+    Nothing is synthesized: the colon namespace is renamed 1:1 to the
+    underscore names Spark Dashboard's VllmAdapter matches
+    (`vllm:prompt_tokens_total` -> `vllm_prompt_tokens_total`), labels are
+    preserved and every non-vLLM family is dropped. The probe subsystem is
+    disabled here - the engine measures its own latencies, so probing would
+    only add load.
 
 v3 fixes vs v2 (2026-10-19, all observed live on spark3):
   - v2 credited the held burst rate into a synthetic generation counter AND
@@ -75,6 +85,10 @@ POLL = float(os.environ.get("TF_POLL_INTERVAL", "2"))
 SAMPLE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)(?:\s+\S+)?$")
 META_RE = re.compile(r"^# (HELP|TYPE)\s+(\S+)(?:\s(.*))?$")
 PREFIXES = ("tensorfold_health:", "tensorfold:")
+# Native vLLM exposition namespace (colon-separated). Spark Dashboard's
+# VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
+VLLM_PREFIX = "vllm:"
+VERSION = "1.1.0"
 
 # Direct base-name renames (after stripping the tensorfold: prefix).
 # The "requests_running"/"requests_waiting" mirrors map to the same vLLM
@@ -236,16 +250,27 @@ SCHEMA_SOURCES = {
         "pf": ("tensorfold:time_to_first_token_seconds_sum",),
         "run": ("tensorfold:requests_running",),
     },
+    "vllm-v1": {
+        "gen": ("vllm:generation_tokens_total",),
+        "dec": ("vllm:request_decode_time_seconds_sum",),
+        "prompt": ("vllm:prompt_tokens_total",),
+        "pf": ("vllm:time_to_first_token_seconds_sum",),
+        "run": ("vllm:num_requests_running",),
+    },
 }
 
 
 def detect_schema(text):
     """Classify the upstream /metrics schema (engine auto-detection).
 
+    vllm-v1:   native vLLM exposition (`vllm:prompt_tokens_total` with
+               engine/model_name labels) - e.g. the exlr8 GLM build
     zig-v1:    underscore families with labels (the flash17 Zig engine)
     python-v1: colon families (tensorfold:*) from the Python engine
     unknown:   nothing recognised
     """
+    if "vllm:prompt_tokens_total" in text or "vllm:generation_tokens_total" in text:
+        return "vllm-v1"
     if "tensorfold_completion_tokens_total" in text or "tensorfold_uptime_seconds" in text:
         return "zig-v1"
     if "tensorfold:generation_tokens_total" in text:
@@ -300,6 +325,17 @@ def update_native_stats(text, now):
                         STATE.rate_prefill_hold = None  # new era: no rate history
                     STATE.prev_uptime = up
             STATE.last_inflight = running
+    elif STATE.schema == "vllm-v1":
+        # Native vLLM: cached prompt tokens are the engine's own prefix-cache
+        # hits counter; in-flight requests are its running gauge.
+        cached_v = None
+        for line in text.splitlines():
+            if line.startswith("vllm:prefix_cache_hits_total"):
+                cached_v = _fnum(line)  # last match wins
+        with STATE.lock:
+            if cached_v is not None:
+                STATE.last_cached = cached_v
+            STATE.last_inflight = running
     with STATE.lock:
         if STATE.window:
             _, p_gen, p_dec, p_prompt, p_pf, p_cached = STATE.window[-1]
@@ -308,7 +344,8 @@ def update_native_stats(text, now):
                 STATE.window = []
                 STATE.rate_decode = 0.0
                 STATE.rate_prefill = 0.0
-        cached_wv = STATE.last_cached if STATE.schema == "zig-v1" else None
+        cached_wv = (STATE.last_cached
+                     if STATE.schema in ("zig-v1", "vllm-v1") else None)
         STATE.window.append((now, gen, dec, prompt, pf, cached_wv))
         cutoff = now - RATE_WINDOW_S
         while STATE.window and STATE.window[0][0] < cutoff:
@@ -335,7 +372,7 @@ def update_native_stats(text, now):
                     STATE.rate_prefill = max(0.0, d_prompt - d_cached) / d_pf
                     if STATE.rate_prefill > 0:
                         STATE.rate_prefill_hold = STATE.rate_prefill
-    if STATE.schema == "zig-v1":
+    if STATE.schema in ("zig-v1", "vllm-v1"):
         with STATE.lock:
             cached_now = STATE.last_cached
             if (cached_now is not None and STATE.prev_cached is not None
@@ -501,8 +538,102 @@ def zig_vllm_bridge(text):
     return "".join(out).encode()
 
 
+def self_status_lines(profile_value):
+    """Common tfexporter self-observability series for any engine profile."""
+    with STATE.lock:
+        ok_ts = STATE.last_ok_ts
+        rate_decode = STATE.rate_decode
+        rate_prefill = STATE.rate_prefill
+    now = time.time()
+    rows = (
+        ("tfexporter_upstream_ok", "1", "gauge",
+         "1 when the last upstream poll succeeded."),
+        ("tfexporter_last_success_timestamp_seconds", str(int(ok_ts)), "gauge",
+         "Unix time of the last successful upstream poll."),
+        ("tfexporter_upstream_lag_seconds", f"{max(0.0, now - ok_ts):.1f}",
+         "gauge", "Seconds since the last successful upstream poll."),
+        ("tfexporter_engine_profile", str(profile_value), "gauge",
+         "Detected upstream profile: 0 = TensorFold health, 1 = TensorFold "
+         "native, 2 = native vLLM passthrough."),
+        ("tfexporter_live_decode_tps", f"{rate_decode or 0.0:.1f}", "gauge",
+         "Held decode rate (tokens/s): delta(generation tokens) / "
+         "delta(decode seconds) over the trailing window; 0 when idle."),
+        ("tfexporter_live_prefill_tps", f"{rate_prefill or 0.0:.1f}", "gauge",
+         "Held prefill rate (tokens/s): delta(prompt tokens - cached tokens) "
+         "/ delta(TTFT seconds) over the trailing window; 0 when idle."),
+    )
+    out = []
+    for name, value, kind, doc in rows:
+        out.append("# HELP " + name + " " + doc)
+        out.append("# TYPE " + name + " " + kind)
+        out.append(name + " " + value)
+    return out
+
+
+def vllm_rewrite(text):
+    """Passthrough for a native vLLM upstream (schema vllm-v1).
+
+    The engine already serves honest `vllm:*` families, so nothing is
+    synthesized: the colon namespace is renamed 1:1 to the underscore names
+    the dashboard adapter matches, labels (engine, model_name,
+    finished_reason, le) are preserved verbatim, and non-vLLM families
+    (http_*, process_*, python_*) are dropped. Only documented zeros are
+    added for families this engine build does not export.
+    """
+    out = []
+    seen = set()        # (mapped name, labels) - no duplicate samples
+    sample_names = set()
+    meta_seen = set()   # (kind, mapped name) - HELP/TYPE emitted once
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            m = META_RE.match(line)
+            if not m:
+                continue
+            kind, name, doc = m.group(1), m.group(2), (m.group(3) or "")
+            if not name.startswith(VLLM_PREFIX):
+                continue
+            mapped = name.replace(":", "_")
+            if (kind, mapped) in meta_seen:
+                continue
+            meta_seen.add((kind, mapped))
+            out.append("# " + kind + " " + mapped
+                       + ((" " + doc) if doc else ""))
+            continue
+        m = SAMPLE_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if not name.startswith(VLLM_PREFIX):
+            continue
+        mapped = name.replace(":", "_")
+        labels, value = m.group(2) or "", m.group(3)
+        key = (mapped, labels)
+        if key in seen:
+            continue
+        seen.add(key)
+        sample_names.add(mapped)
+        out.append(mapped + labels + " " + value)
+
+    # Families this vLLM build may not export: documented zero, so the
+    # Requests panel sums a complete running/waiting/swapped set.
+    if "vllm_num_requests_swapped" not in sample_names:
+        out.append("# HELP vllm_num_requests_swapped Swapped requests "
+                   "(not exported by this engine build; always 0).")
+        out.append("# TYPE vllm_num_requests_swapped gauge")
+        out.append("vllm_num_requests_swapped 0")
+
+    out.extend(self_status_lines(2))
+    return ("\n".join(out) + "\n").encode()
+
+
 def rewrite(text):
-    """Translate a TensorFold metrics exposition into vllm_* families."""
+    """Translate an upstream metrics exposition into vllm_* families."""
+    if detect_schema(text) == "vllm-v1":
+        # Native vLLM engine: nothing to translate, only the namespace rename.
+        return vllm_rewrite(text)
     families = {}  # mapped family key -> [sample lines] (keys may carry _bucket/_sum/_count)
     meta = {}      # mapped BARE family name -> {"help": str|None, "type": str|None}
     kv_stream_max = None
@@ -870,7 +1001,8 @@ def poll_loop():
                 update_models_cache()
                 try:
                     with STATE.lock:
-                        STATE.native_raw = text.encode("utf-8", "replace")
+                        STATE.native_raw = (b"" if schema == "vllm-v1"
+                                            else text.encode("utf-8", "replace"))
                 except Exception:
                     pass
             try:
@@ -936,7 +1068,9 @@ class Handler(BaseHTTPRequestHandler):
     def _v4_gauges(self):
         NL = chr(10)
         with STATE.lock:
-            raw = STATE.native_raw
+            # vllm-v1: the passthrough body already carries the renamed
+            # families - never append the raw colon exposition.
+            raw = b"" if STATE.schema == "vllm-v1" else STATE.native_raw
             vals = dict(rate_decode=STATE.rate_decode, rate_prefill=STATE.rate_prefill,
                         restarts=STATE.restarts, stalled=STATE.last_stalled,
                         fatal=STATE.last_fatal, inflight=STATE.last_inflight,
@@ -1094,10 +1228,22 @@ def _probe_once():
     return ttft, e2e, intervals, tokens
 
 
+def probe_enabled():
+    """Probe only engines that expose no latency histograms of their own.
+
+    A native vLLM upstream measures TTFT/E2E/ITL/TPOT itself, so probing it
+    would add load and duplicate honest engine series.
+    """
+    with STATE.lock:
+        return STATE.schema != "vllm-v1"
+
+
 def probe_loop():
     """Measure latencies every 45s; keep rolling sums and bucket histograms."""
     while True:
         time.sleep(45)
+        if not probe_enabled():
+            continue
         try:
             ttft, e2e, intervals, tokens = _probe_once()
         except (urllib.error.URLError, OSError, ValueError):
@@ -1189,7 +1335,8 @@ def main():
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=probe_loop, daemon=True).start()
     server = ThreadingHTTPServer((BIND, PORT), Handler)
-    print(f"tensorfold-metrics-exporter v3 listening on {BIND}:{PORT} -> {UPSTREAM}", flush=True)
+    print(f"tensorfold-metrics-exporter v{VERSION} listening on "
+          f"{BIND}:{PORT} -> {UPSTREAM}", flush=True)
     server.serve_forever()
 
 

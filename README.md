@@ -21,6 +21,11 @@ own streaming probe (TTFT / E2E / ITL / TPOT — feeding the SLO goodput tiles),
 and proxies every other GET path (`/v1/models`, `/health`) to the upstream
 unchanged.
 
+A third profile covers a **native vLLM engine** (e.g. the exlr8 GLM build):
+there the upstream already serves honest `vllm:*` families, so the exporter
+only renames the colon namespace to the underscore names the adapter matches —
+no synthesis, no probe.
+
 No changes to the engine or the dashboard are required.
 
 ## Why not a plain rewrite?
@@ -44,12 +49,39 @@ dashboard shows `--` rather than a made-up number.
 
 `detect_schema()` classifies the upstream exposition on every poll:
 
+- **`vllm-v1`** — a native vLLM engine (`vllm:prompt_tokens_total{engine=…,model_name=…}`),
+  e.g. the exlr8 GLM build. Passed through: colon families renamed 1:1 to
+  underscore names, labels preserved, non-vLLM families dropped.
 - **`zig-v1`** — underscore families (`tensorfold_prompt_tokens_total{model=…}`),
   the flash17 Zig engine. Primary target: raw families + `/health` JSON
   (in-flight, spec-decode counters, streams).
 - **`python-v1`** — colon families (`tensorfold:prompt_tokens_total`), the
   Python glm53 engine. Legacy path: family rename + health-counter synthesis.
 - **`unknown`** — nothing rewritten; the exposition passes through untouched.
+
+## Metric mapping (vllm-v1 engine — native vLLM passthrough)
+
+Nothing is synthesized in this profile: the engine's own series are renamed
+and served as-is, so every dashboard panel reads engine truth.
+
+| Native vLLM source | Exported as | Notes |
+|---|---|---|
+| `vllm:prompt_tokens_total` | `vllm_prompt_tokens_total` | counter, labels kept |
+| `vllm:generation_tokens_total` | `vllm_generation_tokens_total` | counter, labels kept |
+| `vllm:num_requests_{running,waiting}` | `vllm_num_requests_{running,waiting}` | gauges |
+| `vllm:num_requests_swapped` | `vllm_num_requests_swapped` | documented zero when the build does not export it |
+| `vllm:kv_cache_usage_perc` | `vllm_kv_cache_usage_perc` | ratio 0…1 (panel ×100) |
+| `vllm:prefix_cache_{hits,queries}_total` | `vllm_prefix_cache_{hits,queries}_total` | hit rate = hits/queries |
+| `vllm:time_to_first_token_seconds_{bucket,sum,count}` | `vllm_time_to_first_token_seconds_*` | real histogram → percentiles + SLO goodput |
+| `vllm:request_time_per_output_token_seconds_{sum,count}` | `vllm_request_time_per_output_token_seconds_*` | Decode *Per-Req Avg* |
+| `vllm:e2e_request_latency_seconds_*`, `vllm:inter_token_latency_seconds_*` | same names, underscores | E2E / ITL panels |
+| `vllm:request_queue_time_seconds_*`, `vllm:num_preemptions_total`, `vllm:iteration_tokens_total_*` | same names, underscores | queue, preemption, batch panels |
+| `vllm:spec_decode_num_{drafts,draft_tokens,accepted_tokens}_total` | same names, underscores | acceptance rate + mean acceptance length |
+| `tfexporter_live_{decode,prefill}_tps` | derived | windowed deltas of the engine counters (held while busy, 0 idle) |
+| `tfexporter_engine_profile` | `2` | profile marker (`0` health, `1` TensorFold native, `2` native vLLM) |
+
+`http_*`, `process_*` and `python_*` families of the engine exposition are
+dropped — the dashboard consumes only `vllm_*` and `tfexporter_*`.
 
 ## Persistent counters
 
@@ -147,7 +179,10 @@ then `sudo systemctl restart spark-dashboard`.
 
 ## Tests
 
-30 unit tests cover schema detection, windowed rate math (cache-token
+50 unit tests cover schema detection (TensorFold zig/python **and** native
+vLLM), the vllm-v1 colon → underscore passthrough (label preservation,
+metadata ordering, duplicate suppression, honest swapped zero), windowed rate
+math (cache-token
 exclusion, busy/idle hold, engine-era reset), the persistence round-trip and
 offset continuation, the bridge contract (series presence, honest omissions,
 sample uniqueness), histogram bucketing + SLO bucket edges, and a deadlock
@@ -170,6 +205,10 @@ CI runs both on Python 3.8 and 3.12 (`.github/workflows/ci.yml`).
 - Prefill *Per-Req Avg* follows the current load regime (600 s window, held
   through idle phases); after an engine restart it needs one prefill-active
   window to produce a fresh rate (cumulative fallback until then).
+- In the `vllm-v1` profile the probe subsystem is **off** (the engine measures
+  its own latencies) and counters are served straight from the engine: an
+  engine restart resets them exactly as a plain vLLM scrape would, with no
+  offset continuation.
 
 ## Contributing
 

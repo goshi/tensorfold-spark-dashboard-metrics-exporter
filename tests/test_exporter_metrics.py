@@ -1,8 +1,9 @@
 """Unit tests for the tensorfold-metrics-exporter metric math.
 
 Run on spark3: python3 -m unittest discover -s tests -v
-Covers: schema detection, zig rate windows, windowed cache-hit ratio,
-vllm bridge contract, histogram bucketing, restart detection, v4 gauges.
+Covers: schema detection (TensorFold zig/python + native vLLM), zig rate
+windows, windowed cache-hit ratio, vllm bridge contract, the vllm-v1 colon ->
+underscore passthrough, histogram bucketing, restart detection, v4 gauges.
 """
 import importlib.util
 import os
@@ -412,6 +413,237 @@ class ExporterMathTests(unittest.TestCase):
         finally:
             m.PERSIST_PATH = old_path
             os.remove("/tmp/test_counters_roundtrip.json")
+
+
+
+# --- native vLLM (exlr8) exposition fixture --------------------------------
+
+def vllm_text(gen=37082.0, dec_s=500.0, prompt=878696.0, ttft_s=91.5,
+              cached=87552.0, running=1.0):
+    """One poll of a native vLLM engine (`vllm:*` colon families)."""
+    lbl = '{engine="0",model_name="glm-5.3-flash"}'
+    return (
+        '# HELP vllm:prompt_tokens_total Number of prefill tokens processed.\n'
+        '# TYPE vllm:prompt_tokens_total counter\n'
+        'vllm:prompt_tokens_total' + lbl + ' %s\n' % prompt
+        + '# HELP vllm:generation_tokens_total Number of generation tokens processed.\n'
+        '# TYPE vllm:generation_tokens_total counter\n'
+        'vllm:generation_tokens_total' + lbl + ' %s\n' % gen
+        + '# HELP vllm:num_requests_running Number of requests in execution batches.\n'
+        '# TYPE vllm:num_requests_running gauge\n'
+        'vllm:num_requests_running' + lbl + ' %s\n' % running
+        + '# TYPE vllm:num_requests_waiting gauge\n'
+        'vllm:num_requests_waiting' + lbl + ' 0.0\n'
+        + '# TYPE vllm:kv_cache_usage_perc gauge\n'
+        'vllm:kv_cache_usage_perc' + lbl + ' 0.25\n'
+        + '# TYPE vllm:prefix_cache_hits_total counter\n'
+        'vllm:prefix_cache_hits_total' + lbl + ' %s\n' % cached
+        + '# TYPE vllm:prefix_cache_queries_total counter\n'
+        'vllm:prefix_cache_queries_total' + lbl + ' %s\n' % prompt
+        + '# HELP vllm:time_to_first_token_seconds Histogram of TTFT.\n'
+        '# TYPE vllm:time_to_first_token_seconds histogram\n'
+        'vllm:time_to_first_token_seconds_bucket{engine="0",le="0.5",model_name="glm-5.3-flash"} 22.0\n'
+        'vllm:time_to_first_token_seconds_bucket{engine="0",le="+Inf",model_name="glm-5.3-flash"} 197.0\n'
+        'vllm:time_to_first_token_seconds_sum' + lbl + ' %s\n' % ttft_s
+        + 'vllm:time_to_first_token_seconds_count' + lbl + ' 197.0\n'
+        + '# TYPE vllm:request_time_per_output_token_seconds histogram\n'
+        'vllm:request_time_per_output_token_seconds_sum' + lbl + ' 640.2\n'
+        'vllm:request_time_per_output_token_seconds_count' + lbl + ' %s\n' % gen
+        + '# TYPE vllm:request_decode_time_seconds histogram\n'
+        'vllm:request_decode_time_seconds_sum' + lbl + ' %s\n' % dec_s
+        + 'vllm:request_decode_time_seconds_count' + lbl + ' 20000.0\n'
+        + '# TYPE vllm:spec_decode_num_drafts_total counter\n'
+        'vllm:spec_decode_num_drafts_total' + lbl + ' 11124.0\n'
+        + '# TYPE process_resident_memory_bytes gauge\n'
+        'process_resident_memory_bytes 1.0\n'
+        '# TYPE http_requests_total counter\n'
+        'http_requests_total{handler="metrics"} 12.0\n'
+    )
+
+
+VLLM_TEXT = vllm_text()
+
+
+class VllmPassthroughTests(unittest.TestCase):
+    """vllm-v1: a native vLLM upstream is detected and passed through with
+    colon families renamed 1:1 to the underscore names the adapter matches."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_exporter()
+
+    def setUp(self):
+        st = self.m.STATE
+        st.schema = "vllm-v1"
+        st.window = []
+        st.rate_decode = 0.0
+        st.rate_prefill = 0.0
+        st.rate_prefill_hold = None
+        st.busy_polls = 0
+        st.cache_ratio = None
+        st.prev_cached = None
+        st.prev_prompt_r = None
+        st.last_cached = None
+        st.last_inflight = 0
+        st.last_stalled = 0
+        st.last_fatal = 0
+        st.last_rejected = None
+        st.offsets = {}
+        st.native_raw = b""
+        st.probe_hist = {}
+
+    # --- detection ---
+
+    def test_detect_schema_vllm(self):
+        self.assertEqual(self.m.detect_schema(VLLM_TEXT), "vllm-v1")
+
+    def test_detect_schema_vllm_wins_over_mixed_text(self):
+        self.assertEqual(
+            self.m.detect_schema(VLLM_TEXT + "tensorfold:prompt_tokens_total 5\n"),
+            "vllm-v1")
+
+    def test_detect_schema_zig_still_wins_on_tensorfold(self):
+        self.assertEqual(self.m.detect_schema(ZIG_TEXT), "zig-v1")
+
+    # --- passthrough contract ---
+
+    def test_passthrough_renames_families_and_keeps_labels(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        self.assertIn('vllm_prompt_tokens_total{engine="0",model_name="glm-5.3-flash"} 878696.0', out)
+        self.assertIn('vllm_kv_cache_usage_perc{engine="0",model_name="glm-5.3-flash"} 0.25', out)
+        self.assertIn('vllm_time_to_first_token_seconds_bucket{engine="0",le="0.5",model_name="glm-5.3-flash"} 22.0', out)
+
+    def test_passthrough_has_no_colon_in_sample_names(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        for line in out.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name = line.split("{")[0].split(" ")[0]
+            self.assertNotIn(":", name, line)
+
+    def test_passthrough_metadata_precedes_samples(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        self.assertIn("# TYPE vllm_time_to_first_token_seconds histogram", out)
+        self.assertIn("# HELP vllm_time_to_first_token_seconds Histogram of TTFT.", out)
+        self.assertLess(out.index("# TYPE vllm_time_to_first_token_seconds histogram"),
+                        out.index("vllm_time_to_first_token_seconds_bucket"))
+
+    def test_passthrough_metadata_emitted_once(self):
+        text = VLLM_TEXT + "# TYPE vllm:num_requests_running gauge\n"
+        out = self.m.vllm_rewrite(text).decode()
+        self.assertEqual(out.count("# TYPE vllm_num_requests_running gauge"), 1)
+
+    def test_passthrough_drops_non_vllm_families(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        for bad in ("process_resident_memory_bytes", "http_requests_total"):
+            self.assertNotIn(bad, out)
+
+    def test_passthrough_no_duplicate_samples(self):
+        text = VLLM_TEXT + 'vllm:prompt_tokens_total{engine="0",model_name="glm-5.3-flash"} 878696.0\n'
+        out = self.m.vllm_rewrite(text).decode()
+        samples = [ln for ln in out.splitlines()
+                   if ln.startswith('vllm_prompt_tokens_total{')]
+        self.assertEqual(len(samples), 1)
+
+    def test_passthrough_emits_swapped_zero_once(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        lines = [ln for ln in out.splitlines()
+                 if ln.startswith("vllm_num_requests_swapped ")]
+        self.assertEqual(lines, ["vllm_num_requests_swapped 0"])
+
+    def test_passthrough_keeps_engine_swapped_when_exported(self):
+        text = VLLM_TEXT + ('# TYPE vllm:num_requests_swapped gauge\n'
+                            'vllm:num_requests_swapped{engine="0"} 2.0\n')
+        out = self.m.vllm_rewrite(text).decode()
+        self.assertIn('vllm_num_requests_swapped{engine="0"} 2.0', out)
+        self.assertNotIn("vllm_num_requests_swapped 0", out)
+
+    def test_passthrough_self_status_and_profile(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        self.assertIn("tfexporter_engine_profile 2", out)
+        self.assertIn("tfexporter_upstream_ok 1", out)
+        self.assertIn("# TYPE tfexporter_upstream_lag_seconds gauge", out)
+
+    def test_adapter_series_inventory_is_complete(self):
+        out = self.m.vllm_rewrite(VLLM_TEXT).decode()
+        for name in ("vllm_prompt_tokens_total", "vllm_generation_tokens_total",
+                     "vllm_num_requests_running", "vllm_num_requests_waiting",
+                     "vllm_num_requests_swapped", "vllm_kv_cache_usage_perc",
+                     "vllm_prefix_cache_hits_total",
+                     "vllm_prefix_cache_queries_total",
+                     "vllm_time_to_first_token_seconds_sum",
+                     "vllm_time_to_first_token_seconds_count",
+                     "vllm_request_time_per_output_token_seconds_sum",
+                     "vllm_request_time_per_output_token_seconds_count",
+                     "vllm_spec_decode_num_drafts_total"):
+            self.assertIn(name, out)
+
+    def test_rewrite_routes_vllm_schema_to_passthrough(self):
+        out = self.m.rewrite(VLLM_TEXT).decode()
+        self.assertIn("vllm_prompt_tokens_total", out)
+        self.assertNotIn("tensorfold", out)
+        self.assertNotIn("vllm:", "".join(
+            ln.split("{")[0].split(" ")[0]
+            for ln in out.splitlines() if ln and not ln.startswith("#")))
+
+    # --- live rates / state from the vllm-v1 schema ---
+
+    def test_vllm_live_rates_and_cache_ratio(self):
+        m = self.m
+        a = vllm_text()
+        b = vllm_text(gen=38082.0, dec_s=520.0, prompt=888696.0, ttft_s=96.5,
+                      cached=92552.0, running=2.0)
+        m.update_native_stats(a, 1000.0)
+        m.update_native_stats(b, 1010.0)
+        self.assertAlmostEqual(m.STATE.rate_decode, 50.0, places=6)      # 1000 tok / 20 s
+        self.assertAlmostEqual(m.STATE.rate_prefill, 1000.0, places=6)   # (10000-5000) / 5 s
+        self.assertAlmostEqual(m.STATE.cache_ratio, 0.5, places=6)       # 5000 / 10000
+        self.assertEqual(m.STATE.last_inflight, 2)
+        self.assertEqual(m.STATE.last_cached, 92552.0)
+
+    def test_vllm_idle_poll_zeroes_rates(self):
+        m = self.m
+        m.update_native_stats(vllm_text(), 1000.0)
+        m.update_native_stats(vllm_text(gen=38082.0, dec_s=520.0, prompt=888696.0,
+                                        ttft_s=96.5, cached=92552.0, running=2.0),
+                              1010.0)
+        self.assertGreater(m.STATE.rate_decode, 0.0)
+        m.update_native_stats(vllm_text(gen=38082.0, dec_s=520.0, prompt=888696.0,
+                                        ttft_s=96.5, cached=92552.0, running=0.0),
+                              1020.0)
+        self.assertEqual(m.STATE.rate_decode, 0.0)
+        self.assertEqual(m.STATE.rate_prefill, 0.0)
+
+    def test_vllm_rates_exported_as_gauges(self):
+        m = self.m
+        m.update_native_stats(vllm_text(), 1000.0)
+        step = vllm_text(gen=38082.0, dec_s=520.0, prompt=888696.0, ttft_s=96.5,
+                         cached=92552.0, running=2.0)
+        m.update_native_stats(step, 1010.0)
+        out = m.rewrite(step).decode()
+        self.assertIn("tfexporter_live_decode_tps 50.0", out)
+        self.assertIn("tfexporter_live_prefill_tps 1000.0", out)
+
+    # --- probe must stay off for engines that measure their own latencies ---
+
+    def test_probe_disabled_for_vllm_profile(self):
+        self.assertFalse(self.m.probe_enabled())
+
+    def test_probe_enabled_for_tensorfold_profiles(self):
+        self.m.STATE.schema = "zig-v1"
+        self.assertTrue(self.m.probe_enabled())
+        self.m.STATE.schema = "python-v1"
+        self.assertTrue(self.m.probe_enabled())
+
+    # --- raw colon exposition must never leak through the v4 gauges ---
+
+    def test_v4_gauges_do_not_replay_raw_colon_text(self):
+        m = self.m
+        m.STATE.native_raw = VLLM_TEXT.encode()
+        handler = object.__new__(m.Handler)
+        body = handler._v4_gauges().decode()
+        self.assertNotIn("vllm:", body)
+        self.assertIn('tfexporter_engine_schema_info{schema="vllm-v1"', body)
 
 
 if __name__ == "__main__":

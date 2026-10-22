@@ -3,6 +3,45 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.0] - 2026-10-22
+
+### Added
+- **`vllm-v1` engine auto-detection + passthrough.** A native vLLM upstream
+  (the exlr8 GLM build: `vllm:prompt_tokens_total{engine=…,model_name=…}`) is
+  now recognised on every poll. Its colon families are renamed 1:1 to the
+  underscore names Spark Dashboard's `VllmAdapter` matches, labels
+  (`engine`, `model_name`, `finished_reason`, `le`) are preserved verbatim,
+  and every non-vLLM family (`http_*`, `process_*`, `python_*`) is dropped.
+  Nothing is synthesized: TTFT/E2E/ITL/TPOT histograms, KV-cache usage,
+  prefix-cache counters and spec-decode counters come straight from the
+  engine, so percentiles, SLO goodput and cache panels read engine truth.
+- **Windowed live rates for the vllm-v1 profile** — `tfexporter_live_decode_tps`
+  = Δgeneration tokens / Δdecode seconds and `tfexporter_live_prefill_tps` =
+  Δ(prompt − cached tokens) / ΔTTFT seconds, plus
+  `tfexporter_cache_hit_ratio`, all from the engine's own counters over the
+  600 s window (held while busy, 0 when idle).
+- **Documented zero for `vllm_num_requests_swapped`** when the engine build
+  does not export it, so the Requests panel sums a complete
+  running/waiting/swapped set.
+
+### Changed
+- `tfexporter_engine_profile` is now `2` for the native vLLM passthrough
+  (`0` TensorFold health, `1` TensorFold native); its `# HELP` enumerates all
+  three profiles.
+- The probe subsystem is **disabled** in the vllm-v1 profile — a native vLLM
+  engine measures its own request latencies, so probing would only add load
+  and duplicate honest series (`probe_enabled()`).
+- The raw upstream exposition is no longer replayed by the self-status gauges
+  for vllm-v1 (it would inject colon families into the output).
+- Version banner reports `v1.1.0`.
+
+### Tests
+- 20 new unit tests (50 total) covering vllm-v1 detection (including mixed
+  expositions), the passthrough contract (label preservation, metadata before
+  samples, metadata emitted once, duplicate suppression, non-vLLM families
+  dropped, swapped-zero behaviour, adapter series inventory), live-rate math
+  and idle decay, probe gating, and the raw-exposition leak regression.
+
 ## [1.0.0] - 2026-10-21
 
 First public release.
