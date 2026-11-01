@@ -635,6 +635,52 @@ class VllmPassthroughTests(unittest.TestCase):
         self.m.STATE.schema = "python-v1"
         self.assertTrue(self.m.probe_enabled())
 
+    # --- the gate must follow what the ENGINE publishes, not what we emit ---
+
+    HIST_BODY = ("# TYPE tensorfold:time_to_first_token_seconds histogram\n"
+                 "tensorfold:time_to_first_token_seconds_count 10\n"
+                 "tensorfold:request_time_per_output_token_seconds_count 9\n")
+    PLAIN_BODY = "tensorfold:prompt_tokens_total 123\n"
+
+    def test_probe_disabled_when_engine_publishes_histograms(self):
+        m = self.m
+        saved = m.ENGINE_HAS_LATENCY_HIST
+        try:
+            m.ENGINE_HAS_LATENCY_HIST = False
+            m.STATE.schema = "zig-v1"
+            m.note_engine_latency_hist(self.HIST_BODY)
+            self.assertTrue(m.ENGINE_HAS_LATENCY_HIST)
+            self.assertFalse(m.probe_enabled())
+        finally:
+            m.ENGINE_HAS_LATENCY_HIST = saved
+
+    def test_probe_detector_transitions_both_ways(self):
+        m = self.m
+        saved = m.ENGINE_HAS_LATENCY_HIST
+        try:
+            m.ENGINE_HAS_LATENCY_HIST = False
+            m.STATE.schema = "zig-v1"
+            self.assertTrue(m.probe_enabled())          # nothing published yet
+            m.note_engine_latency_hist(self.HIST_BODY)
+            self.assertFalse(m.probe_enabled())         # engine measures itself
+            m.note_engine_latency_hist(self.PLAIN_BODY)
+            self.assertTrue(m.probe_enabled())          # families went away again
+        finally:
+            m.ENGINE_HAS_LATENCY_HIST = saved
+
+    def test_probe_never_probes_vllm_even_without_histograms(self):
+        m = self.m
+        saved = m.ENGINE_HAS_LATENCY_HIST
+        try:
+            m.ENGINE_HAS_LATENCY_HIST = False
+            m.note_engine_latency_hist(self.PLAIN_BODY)
+            m.STATE.schema = "vllm-v1"
+            self.assertFalse(m.probe_enabled())
+            m.STATE.schema = "python-v1"
+            self.assertTrue(m.probe_enabled())
+        finally:
+            m.ENGINE_HAS_LATENCY_HIST = saved
+
     # --- raw colon exposition must never leak through the v4 gauges ---
 
     def test_v4_gauges_do_not_replay_raw_colon_text(self):

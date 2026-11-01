@@ -88,7 +88,7 @@ PREFIXES = ("tensorfold_health:", "tensorfold:")
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Direct base-name renames (after stripping the tensorfold: prefix).
 # The "requests_running"/"requests_waiting" mirrors map to the same vLLM
@@ -989,6 +989,7 @@ def poll_loop():
             now = time.time()
             native = "tensorfold_health:" not in text
             schema = detect_schema(text)
+            note_engine_latency_hist(text)
             with STATE.lock:
                 STATE.profile = "native" if native else "health"
                 if schema != STATE.schema:
@@ -1228,14 +1229,38 @@ def _probe_once():
     return ttft, e2e, intervals, tokens
 
 
+# The synthetic probe exists only for engines that cannot measure their own
+# latency (see probe_enabled). TensorFold pin H and newer expose real
+# TTFT/E2E/ITL/TPOT histograms over ALL traffic, so probing them is wasted
+# prefill that also pollutes the honest histograms with a fixed-size artificial
+# request. Detect it from the upstream body only, never from our own output.
+HIST_MARKERS = ("time_to_first_token_seconds",
+                "request_time_per_output_token_seconds")
+ENGINE_HAS_LATENCY_HIST = False
+
+
+def note_engine_latency_hist(text):
+    """Remember whether the upstream already publishes latency histograms."""
+    global ENGINE_HAS_LATENCY_HIST
+    seen = any(marker in text for marker in HIST_MARKERS)
+    if seen != ENGINE_HAS_LATENCY_HIST:
+        ENGINE_HAS_LATENCY_HIST = seen
+        print("tf-exporter: upstream latency histograms "
+              + ("present -> synthetic probe disabled" if seen
+                 else "absent -> synthetic probe enabled"), flush=True)
+
+
 def probe_enabled():
     """Probe only engines that expose no latency histograms of their own.
 
     A native vLLM upstream measures TTFT/E2E/ITL/TPOT itself, so probing it
-    would add load and duplicate honest engine series.
+    would add load and duplicate honest engine series. The same reasoning
+    applies to a TensorFold engine that publishes the same families.
     """
     with STATE.lock:
-        return STATE.schema != "vllm-v1"
+        if STATE.schema == "vllm-v1":
+            return False
+        return not ENGINE_HAS_LATENCY_HIST
 
 
 def probe_loop():

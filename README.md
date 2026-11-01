@@ -17,7 +17,8 @@ The exporter polls the upstream `/metrics`, rewrites the TensorFold families
 into their `vllm_*` equivalents, synthesizes the derived series the dashboard
 expects (per-request decode/prefill averages, live rates, cache ratio,
 speculative-decoding acceptance), measures request-latency histograms with its
-own streaming probe (TTFT / E2E / ITL / TPOT — feeding the SLO goodput tiles),
+own streaming probe **only when the engine cannot measure them itself**
+(TTFT / E2E / ITL / TPOT — feeding the SLO goodput tiles),
 and proxies every other GET path (`/v1/models`, `/health`) to the upstream
 unchanged.
 
@@ -107,6 +108,23 @@ Every 45 s the exporter streams a real chat request through the engine:
   `vllm_inter_token_latency_seconds` and `vllm_time_per_output_token_seconds`
   histograms → the dashboard's latency percentiles and SLO goodput tiles
   (TTFT ≤ 500 ms, ITL/TPOT ≤ 50 ms, E2E ≤ 5 s).
+
+### Auto-disable: never probe an engine that measures its own latency
+
+The probe is a fallback for engines that expose no latency data, not a
+permanent fixture. On every poll the exporter checks the **upstream** body for
+`time_to_first_token_seconds` / `request_time_per_output_token_seconds`
+(`note_engine_latency_hist()` → `probe_enabled()`); when they are present the
+probe thread stays asleep. Detection deliberately ignores the exporter's own
+exposition, which carries the same names after rewriting.
+
+Probing such an engine would cost real prefill on the serving GPU (~2.8k
+prompt tokens per request at the current filler size) and add one fixed-size
+artificial sample to the honest histogram it is trying to imitate. Current
+TensorFold engines (1.1.x) publish the real families, and the `vllm-v1`
+profile has never needed the probe; if an upstream stops publishing them, the
+probe comes back automatically on the next poll. The decision is logged:
+`tf-exporter: upstream latency histograms present -> synthetic probe disabled`.
 
 ## Metric mapping (zig-v1 engine)
 
@@ -199,9 +217,12 @@ CI runs both on Python 3.8 and 3.12 (`.github/workflows/ci.yml`).
 
 - KV-cache percent and queue time have no honest TensorFold source — panels
   show `--` (queue counters are emitted as documented zeros).
-- ITL/TPOT distributions are probe-based: they reflect the probe's requests
-  under current load, not the fleet-wide distribution (the engine exposes
-  none).
+- ITL/TPOT distributions are probe-based **only on engines that expose no
+  latency histograms**: they then reflect the probe's requests under current
+  load, not the fleet-wide distribution. On engines that publish
+  `time_to_first_token_seconds` themselves (TensorFold 1.1.x, native vLLM) the
+  probe is disabled and the panels read the engine's own all-traffic
+  histograms instead.
 - Prefill *Per-Req Avg* follows the current load regime (600 s window, held
   through idle phases); after an engine restart it needs one prefill-active
   window to produce a fresh rate (cumulative fallback until then).

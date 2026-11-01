@@ -3,6 +3,31 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] - 2026-11-01
+
+### Added
+- **Synthetic probe auto-disable.** `probe_enabled()` now also refuses to probe
+  when the upstream already publishes its own latency histograms
+  (`time_to_first_token_seconds`, `request_time_per_output_token_seconds`).
+  The detector `note_engine_latency_hist()` runs on every poll against the
+  **upstream** `/metrics` body only — never against the exporter's own output,
+  which carries the same names after rewriting. When the families disappear
+  again (older engine, upstream change) the probe returns on the next poll.
+  Rationale: current TensorFold engines (1.1.x) serve real TTFT/E2E/ITL/TPOT
+  histograms over all traffic, so the 45 s synthetic request was pure cost —
+  ~2.8k prompt tokens per probe, a few percent of prefill capacity, while
+  contaminating those honest histograms with one fixed-size artificial
+  request. The probe stays exactly where it is needed: engines that cannot
+  measure their own latency.
+  Note `note_engine_latency_hist()` writes a plain module global and takes no
+  lock, so it is safe to call while `STATE.lock` is held elsewhere.
+
+### Tests
+- 3 new unit tests extend the probe-gate contract: probe off when the engine
+  publishes histograms, on when it does not, `vllm-v1` stays off regardless,
+  and both transitions of the detector in one test. The module-level detector
+  flag is saved and restored per test so it cannot leak into other cases.
+
 ## [1.1.0] - 2026-10-22
 
 ### Added
