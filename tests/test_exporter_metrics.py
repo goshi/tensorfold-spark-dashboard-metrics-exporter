@@ -225,8 +225,8 @@ class ExporterMathTests(unittest.TestCase):
         self.assertIn("vllm_spec_decode_num_drafts_total 90000.0", out)
 
     def test_probe_prompt_is_unique_per_call(self):
-        import re
-        src = open(EXPORTER_PATH).read()
+        with open(EXPORTER_PATH, encoding="utf-8") as src_file:
+            src = src_file.read()
         # the nonce is built from uuid4 - verify the construction exists
         self.assertIn("uuid.uuid4().hex[:8]", src)
 

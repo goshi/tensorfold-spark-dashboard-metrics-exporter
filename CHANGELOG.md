@@ -27,6 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   publishes histograms, on when it does not, `vllm-v1` stays off regardless,
   and both transitions of the detector in one test. The module-level detector
   flag is saved and restored per test so it cannot leak into other cases.
+- The probe-nonce test now closes the source file it reads (drops a
+  `ResourceWarning` and an unused import from the suite output).
 
 ## [1.1.0] - 2026-10-22
 
