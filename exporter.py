@@ -88,7 +88,13 @@ PREFIXES = ("tensorfold_health:", "tensorfold:")
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+# How long an engine /health "live" reading stays believable. The engine keeps its own
+# 2 s sliding window (core/lane_host.zig: tokens over window_ns, divided by 2.0), so a
+# few seconds of slack covers the poll gap; past it a dead engine must not keep the
+# tile warm, and we fall back to the exporter-derived window.
+LIVE_FRESH_S = float(os.environ.get("TF_LIVE_FRESH_S", "5"))
 
 # Direct base-name renames (after stripping the tensorfold: prefix).
 # The "requests_running"/"requests_waiting" mirrors map to the same vLLM
@@ -163,6 +169,12 @@ class State:
         self.prev_tok = None
         self.prev_ts = None
         self.live_tps = 0.0
+        # v4.2: the engine's own live block, read from /health's "live" object
+        self.live_engine = None       # dict, or None when the engine lacks the block
+        self.live_engine_ts = 0.0
+        self.queue_waiting = None
+        self.live_connections = None
+        self.prefill_lastjob = None
         # native profile: trailing window of finished counters, held rates
         self.window = []        # (ts, gen_fin, dec_s, prompt_fin, ttft_s)
         self.rate_decode = 0.0  # held true decode tps (delta gen / delta dec_s)
@@ -276,6 +288,103 @@ def detect_schema(text):
     if "tensorfold:generation_tokens_total" in text:
         return "python-v1"
     return "unknown"
+
+
+def update_engine_live(health, now):
+    """Take the engine's own live rates out of /health's "live" block.
+
+    The engine already keeps a 2 s sliding window of decoded tokens, so the exporter
+    must not re-derive and then re-smooth what it is being told. The derived window
+    stays as the fallback for engines without the block (old health-profile builds,
+    native vLLM) and for the seconds around a restart.
+
+    prefill_tokens_per_second is deliberately not used as a rate: the engine writes it
+    once per finished prompt pass, timed from admission, so it carries queue time and
+    is one global last-writer-wins slot. We publish it as an informational series.
+    """
+    live = health.get("live") if isinstance(health, dict) else None
+    if not isinstance(live, dict):
+        with STATE.lock:
+            STATE.live_engine = None
+            STATE.queue_waiting = None
+            STATE.live_connections = None
+            STATE.prefill_lastjob = None
+        return False
+
+    def _num(key):
+        v = live.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    dec = _num("decode_tokens_per_second")
+    if dec is None:
+        with STATE.lock:
+            STATE.live_engine = None
+            STATE.queue_waiting = None
+            STATE.live_connections = None
+            STATE.prefill_lastjob = None
+        return False
+    with STATE.lock:
+        STATE.live_engine = {"decode_tokens_per_second": dec,
+                             "prefill_tokens_per_second": _num("prefill_tokens_per_second"),
+                             "waiting": _num("waiting"),
+                             "connections": _num("connections")}
+        STATE.live_engine_ts = now
+        STATE.queue_waiting = STATE.live_engine["waiting"]
+        STATE.live_connections = STATE.live_engine["connections"]
+        STATE.prefill_lastjob = STATE.live_engine["prefill_tokens_per_second"]
+    return True
+
+
+def live_decode_choice(now=None):
+    """Decide which decode rate the tile shows, and what to publish beside it.
+
+    One place on purpose: the gauge is emitted both by self_status_lines() (native vLLM
+    passthrough) and by rewrite() (both TensorFold profiles), and two emitters with two
+    opinions is how a dashboard ends up showing a stale number. The engine's own 2 s
+    window wins while it is fresh - including a fresh 0, which honestly means "nothing
+    decoded in the last two seconds" - otherwise the exporter's derived window speaks.
+    """
+    now = time.time() if now is None else now
+    with STATE.lock:
+        derived = STATE.rate_decode or 0.0
+        live = dict(STATE.live_engine) if isinstance(STATE.live_engine, dict) else None
+        age = now - STATE.live_engine_ts
+        waiting = STATE.queue_waiting
+        conns = STATE.live_connections
+    fresh = bool(live) and age <= LIVE_FRESH_S
+    if fresh:
+        return {"value": live["decode_tokens_per_second"], "source": 1,
+                "derived": derived, "live": live, "fresh": True,
+                "waiting": waiting, "conns": conns}
+    return {"value": derived, "source": 0, "derived": derived, "live": None,
+            "fresh": False, "waiting": waiting, "conns": conns}
+
+
+def engine_live_series(choice):
+    """The extra series a fresh engine live block buys us, as (name, value, kind, doc)."""
+    rows = []
+    live = choice.get("live")
+    if not live:
+        return rows
+    pj = live.get("prefill_tokens_per_second")
+    if pj is not None:
+        rows.append(("tfexporter_engine_prefill_lastjob_tps", f"{pj:.1f}", "gauge",
+                     "The engine's prefill figure for its most recent finished prompt "
+                     "pass: uncached prompt tokens over the time since ADMISSION, held "
+                     "for the engine's window. Informational only - it carries queue "
+                     "time; use tfexporter_live_prefill_tps for a rate."))
+        rows.append(("tfexporter_prefilling", "1" if pj > 0 else "0", "gauge",
+                     "1 while the engine has published a recent prompt pass."))
+    if live.get("waiting") is not None:
+        rows.append(("tfexporter_queue_waiting", str(int(live["waiting"])), "gauge",
+                     "Requests waiting for a lane, from the same /health snapshot as "
+                     "the live decode rate."))
+    if live.get("connections") is not None:
+        rows.append(("tfexporter_live_connections", str(int(live["connections"])),
+                     "gauge", "Live connections held by the engine, from /health."))
+    return rows
 
 
 def update_native_stats(text, now):
@@ -539,12 +648,17 @@ def zig_vllm_bridge(text):
 
 
 def self_status_lines(profile_value):
-    """Common tfexporter self-observability series for any engine profile."""
+    """Common tfexporter self-observability series for any engine profile.
+
+    The live decode tile prefers the engine's own 2 s window; the exporter-derived
+    window is always emitted next to it so a divergence is visible rather than hidden.
+    """
+    now = time.time()
     with STATE.lock:
         ok_ts = STATE.last_ok_ts
-        rate_decode = STATE.rate_decode
         rate_prefill = STATE.rate_prefill
-    now = time.time()
+    choice = live_decode_choice(now)
+    decode_val, decode_src = choice["value"], choice["source"]
     rows = (
         ("tfexporter_upstream_ok", "1", "gauge",
          "1 when the last upstream poll succeeded."),
@@ -555,13 +669,23 @@ def self_status_lines(profile_value):
         ("tfexporter_engine_profile", str(profile_value), "gauge",
          "Detected upstream profile: 0 = TensorFold health, 1 = TensorFold "
          "native, 2 = native vLLM passthrough."),
-        ("tfexporter_live_decode_tps", f"{rate_decode or 0.0:.1f}", "gauge",
-         "Held decode rate (tokens/s): delta(generation tokens) / "
-         "delta(decode seconds) over the trailing window; 0 when idle."),
+        ("tfexporter_live_decode_tps", f"{decode_val:.1f}", "gauge",
+         "Live decode rate (tokens/s). From the engine's /health live window when "
+         "that reading is fresh (see tfexporter_live_decode_tps_source), else the "
+         "exporter's held window: delta(generation tokens)/delta(decode seconds)."),
+        ("tfexporter_live_decode_tps_source", str(decode_src), "gauge",
+         "Provenance of tfexporter_live_decode_tps: 1 = the engine's own live "
+         "window, 0 = exporter-derived over finished counters."),
+        ("tfexporter_live_decode_tps_derived", f"{choice['derived']:.1f}", "gauge",
+         "The exporter-derived decode rate (tokens/s), kept even when the engine "
+         "supplies one, so the two can be compared."),
         ("tfexporter_live_prefill_tps", f"{rate_prefill or 0.0:.1f}", "gauge",
          "Held prefill rate (tokens/s): delta(prompt tokens - cached tokens) "
-         "/ delta(TTFT seconds) over the trailing window; 0 when idle."),
+         "/ delta(TTFT seconds) over the trailing window; 0 when idle. Always "
+         "exporter-derived: the engine's prefill figure is per-job and includes "
+         "queue time, so it is not a rate."),
     )
+    rows += tuple(engine_live_series(choice))
     out = []
     for name, value, kind, doc in rows:
         out.append("# HELP " + name + " " + doc)
@@ -922,29 +1046,57 @@ def rewrite(text):
     put_sample("tfexporter_engine_profile", "", "1" if profile == "native" else "0")
 
     # 6) Live rate gauges (estimates only; never fed into counters).
-    if profile == "native":
-        set_meta("tfexporter_live_decode_tps", "TYPE", "gauge")
-        set_meta("tfexporter_live_decode_tps", "HELP",
-                 "Held true decode rate: delta(generation_tokens_total) / "
-                 "delta(request_decode_seconds_sum) over the trailing "
-                 f"{int(RATE_WINDOW_S)}s window of finished requests; held "
-                 "while requests are in flight, 0 when idle.")
-        put_sample("tfexporter_live_decode_tps", "", f"{rate_decode or 0.0:.1f}")
-        set_meta("tfexporter_live_prefill_tps", "TYPE", "gauge")
-        set_meta("tfexporter_live_prefill_tps", "HELP",
-                 "Held prefill rate estimate: delta(prompt_tokens_total) / "
-                 "delta(time_to_first_token_seconds_sum) over the trailing "
-                 f"{int(RATE_WINDOW_S)}s window; includes queue time; held "
-                 "while requests are in flight, 0 when idle.")
-        put_sample("tfexporter_live_prefill_tps", "", f"{rate_prefill or 0.0:.1f}")
-    else:
+    #    The engine's own /health live window is preferred when fresh; the derived
+    #    window stays published next to it so a divergence is visible, not hidden.
+    # Which denominator the derived prefill rate really used: the zig engine exposes a
+    # prefill-seconds counter (pure compute), the python engine and the health profile
+    # fall back to TTFT sums (queue included). Say so instead of guessing in the docs.
+    with STATE.lock:
+        prefill_doc_seconds = (profile == "native" and STATE.schema == "zig-v1")
+    choice = live_decode_choice()
+    if profile != "native":
+        # Old health-profile engine: the exporter's own live figure there is the live
+        # completion-counter diff, not the native finished-request window, so that diff
+        # is what the derived series has to report - and what the tile shows until the
+        # engine starts publishing a live block of its own.
         with STATE.lock:
-            live = STATE.live_tps
-        set_meta("tfexporter_live_decode_tps", "TYPE", "gauge")
-        set_meta("tfexporter_live_decode_tps", "HELP",
-                 "Live decode rate (tokens/s) from the live completion counter "
-                 "diff over the last poll interval; 0 when idle.")
-        put_sample("tfexporter_live_decode_tps", "", f"{live:.1f}")
+            health_live = STATE.live_tps or 0.0
+        choice = dict(choice, derived=health_live)
+        if not choice["fresh"]:
+            choice = dict(choice, value=health_live, source=0)
+    for name, value, kind, doc in (
+            ("tfexporter_live_decode_tps", f"{choice['value']:.1f}", "gauge",
+             "Live decode rate (tokens/s). From the engine's /health live window "
+             "when that reading is fresh, else from the exporter: for the native "
+             f"profile delta(generation_tokens_total)/delta(request_decode_seconds_sum) "
+             f"over the trailing {int(RATE_WINDOW_S)}s window of finished requests, "
+             "held while requests are in flight; for the health profile the live "
+             "completion counter diff. 0 when idle."),
+            ("tfexporter_live_decode_tps_source", str(choice["source"]), "gauge",
+             "Provenance of tfexporter_live_decode_tps: 1 = the engine's own live "
+             "window from /health, 0 = exporter-derived."),
+            ("tfexporter_live_decode_tps_derived", f"{choice['derived']:.1f}", "gauge",
+             "The exporter-derived decode rate (tokens/s), always emitted so the "
+             "engine-supplied tile can be compared against it."),
+            ("tfexporter_live_prefill_tps", f"{rate_prefill or 0.0:.1f}", "gauge",
+             "Held prefill rate estimate: delta(prompt tokens - cached tokens) / "
+             + ("delta(tensorfold_prefill_seconds_total), engine compute only, no "
+                "queue time" if prefill_doc_seconds else
+                "delta(time_to_first_token_seconds_sum), which includes queue time")
+             + f", over the trailing {int(RATE_WINDOW_S)}s window; held while requests "
+             "are in flight, 0 when idle. An aggregate over the window, not a per-job "
+             "figure: concurrent requests and prefix-cache hits can push it well above "
+             "any single request's rate. Always exporter-derived, because the engine's "
+             "own prefill figure is per-job and timed from admission, so it is not a "
+             "rate (see tfexporter_engine_prefill_lastjob_tps)."),
+    ):
+        set_meta(name, "TYPE", kind)
+        set_meta(name, "HELP", doc)
+        put_sample(name, "", value)
+    for name, value, kind, doc in engine_live_series(choice):
+        set_meta(name, "TYPE", kind)
+        set_meta(name, "HELP", doc)
+        put_sample(name, "", value)
 
     out = []
     emitted_meta = set()
@@ -1009,6 +1161,7 @@ def poll_loop():
             try:
                 _, hbody, _ = fetch_upstream("/health")
                 STATE.health = json.loads(hbody.decode("utf-8", "replace"))
+                update_engine_live(STATE.health, now)
             except (urllib.error.URLError, OSError, ValueError):
                 pass
             try:

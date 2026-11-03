@@ -142,14 +142,48 @@ probe comes back automatically on the next poll. The decision is logged:
 | `/health` drafted/accepted/rounds | `vllm_spec_decode_num_{draft,accepted}_tokens_total`, `…num_drafts_total` | acceptance rate + mean acceptance length |
 | probe histograms | `vllm_time_to_first_token_seconds` et al. | buckets = probe-measured; TTFT sum/count = engine estimate |
 
-Self-observability: `tfexporter_engine_schema_info`, `tfexporter_live_decode_tps`,
-`tfexporter_live_prefill_tps`, `tfexporter_cache_hit_ratio` (600 s window),
-`tfexporter_mem_available_gib`, `tfexporter_engine_restarts_total`,
-`tfexporter_upstream_ok`, `tfexporter_upstream_lag_seconds`.
+Self-observability: `tfexporter_engine_schema_info`, `tfexporter_live_decode_tps`
+(+ `_source`, `_derived`), `tfexporter_live_prefill_tps`,
+`tfexporter_engine_prefill_lastjob_tps`, `tfexporter_prefilling`,
+`tfexporter_queue_waiting`, `tfexporter_live_connections`,
+`tfexporter_cache_hit_ratio` (600 s window), `tfexporter_mem_available_gib`,
+`tfexporter_engine_restarts_total`, `tfexporter_upstream_ok`,
+`tfexporter_upstream_lag_seconds`.
 
 **Graceful degradation:** after an upstream failure the last good snapshot is
 served for 10 seconds, then the exporter answers `502`. `/healthz` reflects
 upstream liveness.
+
+## Live rates: engine first, ours as fallback
+
+The engine publishes a `live` object in `/health`:
+
+```json
+{"status": "ok", "live": {"connections": 2, "waiting": 1,
+ "decode_tokens_per_second": 72.0, "prefill_tokens_per_second": 1458.2}}
+```
+
+| Series | Source | Note |
+|--------|--------|------|
+| `tfexporter_live_decode_tps` | `live.decode_tokens_per_second` while fresh, else our window | the engine's window is 2 s; a fresh `0` is honest idle, not a gap to paper over |
+| `tfexporter_live_decode_tps_source` | 1 engine / 0 derived | read this before trusting a disagreement |
+| `tfexporter_live_decode_tps_derived` | our window, always | the cross-check |
+| `tfexporter_live_prefill_tps` | our window only | `zig-v1`: `delta(prompt-cached)/delta(prefill_seconds)`, compute only; `python-v1`/health: TTFT-based, queue included |
+| `tfexporter_engine_prefill_lastjob_tps` | `live.prefill_tokens_per_second` | **informational**: one job's figure, timed from admission, last-writer-wins |
+| `tfexporter_prefilling` | same field > 0 | coarse "a prompt pass just happened" |
+| `tfexporter_queue_waiting`, `tfexporter_live_connections` | same `/health` snapshot | consistent with the decode tile |
+
+Two consequences worth knowing before you graph them. First, the exporter
+applies no smoothing of its own on top of the engine's window - stacking a
+filter on a 2 s window only doubles the lag - but it can still trail the engine
+by up to one `TF_POLL_INTERVAL` because it publishes the last snapshot it
+fetched. Second, the engine's prefill figure is not a rate: measured on a live
+TP2 pair it read 197/603/1458 tok/s while that engine served a 49K-token prompt
+at ~1.9K tok/s, because it is written once per finished pass and includes the
+time spent waiting for a lane. Our derived prefill rate is an aggregate over
+the window, so with concurrent requests and prefix-cache hits it can exceed any
+single request's rate; for honest per-request distributions use the engine's
+own `vllm_request_prefill_seconds` histogram instead.
 
 ## Requirements
 
@@ -174,6 +208,7 @@ curl -s localhost:8004/metrics | grep -E '^vllm_' | head
 | `TF_PORT`           | `8004`                  | Port for the exporter to listen on     |
 | `TF_BIND`           | `0.0.0.0`               | Bind address                           |
 | `TF_POLL_INTERVAL`  | `2`                     | Upstream poll interval, seconds        |
+| `TF_LIVE_FRESH_S`   | `5`                     | How long an engine `/health` live reading is trusted before falling back |
 
 ### Run as a systemd service
 
@@ -226,6 +261,9 @@ CI runs both on Python 3.8 and 3.12 (`.github/workflows/ci.yml`).
 - Prefill *Per-Req Avg* follows the current load regime (600 s window, held
   through idle phases); after an engine restart it needs one prefill-active
   window to produce a fresh rate (cumulative fallback until then).
+- The live decode tile trails the engine by up to one poll interval, and it is
+  an instantaneous window rather than a smoothed series - expect it to hit 0
+  during long prefills, which is what "nothing decoded in the last 2 s" means.
 - In the `vllm-v1` profile the probe subsystem is **off** (the engine measures
   its own latencies) and counters are served straight from the engine: an
   engine restart resets them exactly as a plain vLLM scrape would, with no

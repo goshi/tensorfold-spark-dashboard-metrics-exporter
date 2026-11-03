@@ -3,6 +3,69 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-11-03
+
+### Added
+- **Engine-supplied live decode rate.** When the TensorFold server publishes a
+  `live` object in `/health` (`connections`, `waiting`,
+  `decode_tokens_per_second`, `prefill_tokens_per_second`), its decode rate now
+  feeds `tfexporter_live_decode_tps` directly. The engine keeps its own 2 s
+  sliding window (`core/lane_host.zig`: tokens over `window_ns`, divided by
+  2.0), so the exporter no longer re-derives a number the engine already
+  measured. A *fresh* 0 is taken as the truth ("nothing decoded in the last two
+  seconds") rather than being replaced by our held window's last nonzero rate.
+- **Provenance and cross-check series.** `tfexporter_live_decode_tps_source`
+  (1 = the engine's own window, 0 = exporter-derived) and
+  `tfexporter_live_decode_tps_derived` (our window, always emitted) ship next to
+  the tile, so a divergence between the two is visible instead of hidden.
+- **Queue/connection series from the same snapshot** as the live rate:
+  `tfexporter_queue_waiting`, `tfexporter_live_connections`.
+- **The engine's prefill figure, kept informational.**
+  `tfexporter_engine_prefill_lastjob_tps` plus a `tfexporter_prefilling` 0/1
+  flag. It is deliberately *not* used as the prefill rate: the engine writes it
+  once per finished prompt pass, timed from admission (so it carries queue
+  time), into one global last-writer-wins slot. Measured on the live pair, it
+  reported 197/603/1458 tok/s while the same engine was serving a 49K-token
+  prompt at ~1.9K tok/s.
+
+### Changed
+- No double smoothing: the exporter applies no EMA on top of the engine's
+  window. Stacking our filter on the engine's 2 s window would only add lag.
+- Prefill HELP now matches the code per profile: `zig-v1` divides by
+  `tensorfold_prefill_seconds_total` (engine compute, no queue time), while
+  `python-v1`/health profiles divide by TTFT sums (queue included). Both state
+  that the window value is an aggregate, not a per-job rate - concurrent
+  requests and prefix-cache hits can push it far above any single request.
+
+### Fixed
+- `tfexporter_live_decode_tps` is emitted from two places (`self_status_lines()`
+  for the `vllm-v1` passthrough, `rewrite()` for both TensorFold profiles). The
+  first cut of this release changed only one of them and a live run against the
+  engine caught the tile still serving the derived number; the decision now
+  lives in one helper, `live_decode_choice()`, that both emitters call, and a
+  test asserts the two agree.
+
+### Notes
+- The tile can lag the engine by up to one poll interval (`TF_POLL_INTERVAL`,
+  default 2 s): the exporter publishes the last `/health` snapshot it fetched.
+- Freshness is `TF_LIVE_FRESH_S` (default 5 s). Past it - engine restarted,
+  endpoint unreachable, or an old build without the block - the derived window
+  takes over and `…_source` flips to 0.
+- Health-profile engines without a live block keep the live completion-counter
+  diff as both the tile and the derived value; if such an engine grows the
+  block, it upgrades automatically (covered by a test).
+
+### Tests
+- 19 new tests (53 -> 72), one behaviour each, covering every fallback
+  transition: block present, block absent, block stale, block malformed
+  (`true`/`"137"` must not become a rate), fresh-zero taken over a held
+  derived rate, engine prefill staying informational, the engine-only series
+  absent when there is no block, both emitters agreeing, the health profile
+  keeping its diff and upgrading when a block appears, the HELP text naming the
+  denominator the code actually uses, and a worker hammering both helpers to
+  prove no lock re-entrancy. Assertions check emitted sample lines, not raw
+  substrings: a metric name mentioned in another gauge's HELP is not emission.
+
 ## [1.2.0] - 2026-11-01
 
 ### Added

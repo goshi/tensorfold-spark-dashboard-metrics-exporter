@@ -88,6 +88,12 @@ class ExporterMathTests(unittest.TestCase):
         st.last_rejected = None
         st.offsets = {}          # tests must not inherit persistence offsets
         st.rate_prefill_hold = None  # nor the windowed-rate hold
+        # v1.3.0: the engine live block, so a leaked reading cannot bias another test
+        st.live_engine = None
+        st.live_engine_ts = 0.0
+        st.queue_waiting = None
+        st.live_connections = None
+        st.prefill_lastjob = None
 
     # --- schema detection ---
 
@@ -690,6 +696,303 @@ class VllmPassthroughTests(unittest.TestCase):
         body = handler._v4_gauges().decode()
         self.assertNotIn("vllm:", body)
         self.assertIn('tfexporter_engine_schema_info{schema="vllm-v1"', body)
+
+
+class EngineLiveRateTests(unittest.TestCase):
+    """v1.3.0: /health "live" is the primary decode-rate source, with fallbacks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_exporter()
+
+    def setUp(self):
+        st = self.m.STATE
+        st.schema = "zig-v1"
+        st.window = []
+        st.rate_decode = 0.0
+        st.rate_prefill = 0.0
+        st.cache_ratio = None
+        st.prev_cached = None
+        st.prev_prompt_r = None
+        st.restarts = 0
+        st.prev_uptime = None
+        st.probe_hist = {}
+        st.last_cached = None
+        st.last_stalled = 0
+        st.last_fatal = 0
+        st.last_inflight = 0
+        st.last_rejected = None
+        st.offsets = {}
+        st.rate_prefill_hold = None
+        st.live_engine = None
+        st.live_engine_ts = 0.0
+        st.queue_waiting = None
+        st.live_connections = None
+        st.prefill_lastjob = None
+        # a derived window of 20 tok/s decode / 200 tok/s prefill, so every test can
+        # tell "the engine's number was used" from "our window was used"
+        self.m.update_native_stats(ZIG_TEXT, 1000.0)
+        self.m.update_native_stats(ZIG_STEP, 1010.0)
+        self.derived_decode = st.rate_decode
+        self.derived_prefill = st.rate_prefill
+
+    def _rows(self, profile=1):
+        return self.m.self_status_lines(profile)
+
+    def _value(self, rows, name):
+        prefix = name + " "
+        hits = [ln for ln in rows if ln.startswith(prefix)]
+        self.assertEqual(len(hits), 1, "expected exactly one %s line, got %r" % (name, hits))
+        return hits[0].split(" ", 1)[1]
+
+    # --- parsing the block ---
+
+    def test_engine_live_block_is_parsed(self):
+        ok = self.m.update_engine_live(
+            {"status": "ok", "live": {"connections": 3, "waiting": 2,
+                                      "decode_tokens_per_second": 137.4,
+                                      "prefill_tokens_per_second": 2203.0}}, 1000.0)
+        self.assertTrue(ok)
+        st = self.m.STATE
+        self.assertAlmostEqual(st.live_engine["decode_tokens_per_second"], 137.4)
+        self.assertAlmostEqual(st.prefill_lastjob, 2203.0)
+        self.assertEqual(st.queue_waiting, 2.0)
+        self.assertEqual(st.live_connections, 3.0)
+
+    def test_engine_live_block_absent_is_not_an_error(self):
+        self.assertFalse(self.m.update_engine_live({"status": "ok"}, 1000.0))
+        self.assertIsNone(self.m.STATE.live_engine)
+        self.assertFalse(self.m.update_engine_live(None, 1000.0))
+
+    def test_engine_live_block_rejects_bool_and_string(self):
+        # a bool is an int in Python; a string must not become a rate either
+        self.assertFalse(self.m.update_engine_live(
+            {"live": {"decode_tokens_per_second": True}}, 1000.0))
+        self.assertFalse(self.m.update_engine_live(
+            {"live": {"decode_tokens_per_second": "137"}}, 1000.0))
+        self.assertIsNone(self.m.STATE.live_engine)
+
+    # --- the tile follows the engine when it can ---
+
+    def test_native_live_rate_wins_over_the_derived_window(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 137.4}},
+                                  self.m.time.time())
+        rows = self._rows()
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps"), "137.4")
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps_source"), "1")
+        # the derived window stays published next to it, for cross-checking
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps_derived"),
+                         "%.1f" % self.derived_decode)
+        self.assertAlmostEqual(self.derived_decode, 20.0, places=6)
+
+    def test_native_zero_is_taken_while_fresh_not_the_held_derived_rate(self):
+        # the engine says nothing decoded in its 2 s window; that is the truth, even
+        # though our window still holds a rate from requests that finished earlier
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 0.0}},
+                                  self.m.time.time())
+        rows = self._rows()
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps"), "0.0")
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps_source"), "1")
+        self.assertGreater(float(self._value(rows, "tfexporter_live_decode_tps_derived")), 0)
+
+    # --- and falls back when it must ---
+
+    def test_missing_block_falls_back_to_the_derived_window(self):
+        self.m.update_engine_live({"status": "ok"}, self.m.time.time())
+        rows = self._rows()
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps"),
+                         "%.1f" % self.derived_decode)
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps_source"), "0")
+
+    def test_stale_block_falls_back_to_the_derived_window(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 137.4}},
+                                  self.m.time.time() - self.m.LIVE_FRESH_S - 5)
+        rows = self._rows()
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps"),
+                         "%.1f" % self.derived_decode)
+        self.assertEqual(self._value(rows, "tfexporter_live_decode_tps_source"), "0")
+
+    def test_freshness_constant_is_sane(self):
+        self.assertGreater(self.m.LIVE_FRESH_S, 0)
+        self.assertLessEqual(self.m.LIVE_FRESH_S, 30)
+
+    # --- the engine's prefill figure stays informational ---
+
+    def test_engine_prefill_is_not_used_as_the_rate(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 137.4,
+                                            "prefill_tokens_per_second": 2203.0,
+                                            "waiting": 2, "connections": 3}},
+                                  self.m.time.time())
+        rows = self._rows()
+        self.assertEqual(self._value(rows, "tfexporter_live_prefill_tps"),
+                         "%.1f" % self.derived_prefill)
+        self.assertEqual(self._value(rows, "tfexporter_engine_prefill_lastjob_tps"), "2203.0")
+        self.assertEqual(self._value(rows, "tfexporter_prefilling"), "1")
+        self.assertEqual(self._value(rows, "tfexporter_queue_waiting"), "2")
+        self.assertEqual(self._value(rows, "tfexporter_live_connections"), "3")
+
+    def test_no_engine_only_series_when_the_block_is_absent(self):
+        rows = self._rows()
+        for name in ("tfexporter_engine_prefill_lastjob_tps", "tfexporter_prefilling",
+                     "tfexporter_queue_waiting", "tfexporter_live_connections"):
+            self.assertNotIn(name + " ", rows)
+
+    def test_prefilling_zero_when_engine_published_no_recent_pass(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 40.0,
+                                            "prefill_tokens_per_second": 0.0}},
+                                  self.m.time.time())
+        self.assertEqual(self._value(self._rows(), "tfexporter_prefilling"), "0")
+
+    # --- liveness: the two helpers share STATE.lock and must not deadlock ---
+
+    def test_engine_live_and_status_do_not_deadlock(self):
+        # A same-thread nested acquisition would hang forever, so the check is that a
+        # worker hammering both helpers finishes well inside a timeout.
+        finished = []
+
+        def worker():
+            for _ in range(200):
+                self.m.update_engine_live(
+                    {"live": {"decode_tokens_per_second": 10.0, "waiting": 1,
+                              "connections": 2, "prefill_tokens_per_second": 900.0}},
+                    self.m.time.time())
+                self.m.self_status_lines(1)
+            finished.append(True)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(15)
+        self.assertTrue(finished, "worker hung: possible lock re-entrancy deadlock")
+
+
+class NativeRewriteLiveRateTests(unittest.TestCase):
+    """The native profile's own emitter (rewrite()) must use the engine live rate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_exporter()
+
+    def setUp(self):
+        st = self.m.STATE
+        for name, value in (("schema", "zig-v1"), ("window", []), ("rate_decode", 0.0),
+                            ("rate_prefill", 0.0), ("cache_ratio", None),
+                            ("prev_cached", None), ("prev_prompt_r", None),
+                            ("restarts", 0), ("prev_uptime", None), ("probe_hist", {}),
+                            ("last_cached", None), ("last_stalled", 0), ("last_fatal", 0),
+                            ("last_inflight", 0), ("last_rejected", None),
+                            ("offsets", {}), ("rate_prefill_hold", None),
+                            ("live_engine", None), ("live_engine_ts", 0.0),
+                            ("queue_waiting", None), ("live_connections", None),
+                            ("prefill_lastjob", None), ("live_tps", 0.0),
+                            ("profile", "native"), ("native_raw", b"")):
+            setattr(st, name, value)
+        # a derived window to fall back to: 20 tok/s decode
+        self.m.update_native_stats(ZIG_TEXT, 1000.0)
+        self.m.update_native_stats(ZIG_STEP, 1010.0)
+
+    def _body(self, text=ZIG_TEXT):
+        return self.m.rewrite(text).decode("utf-8", "replace")
+
+    @staticmethod
+    def _samples(out):
+        """Emitted sample lines only: a name mentioned in a HELP line is not emission."""
+        return [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+
+    def test_native_rewrite_prefers_the_engine_live_rate(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 137.4,
+                                            "prefill_tokens_per_second": 2203.0,
+                                            "waiting": 2, "connections": 3}},
+                                  self.m.time.time())
+        out = self._body()
+        self.assertIn("tfexporter_live_decode_tps 137.4", out)
+        self.assertIn("tfexporter_live_decode_tps_source 1", out)
+        self.assertIn("tfexporter_live_decode_tps_derived 20.0", out)
+        samples = self._samples(out)
+        self.assertIn("tfexporter_engine_prefill_lastjob_tps 2203.0", samples)
+        self.assertIn("tfexporter_prefilling 1", samples)
+        self.assertIn("tfexporter_queue_waiting 2", samples)
+        self.assertIn("tfexporter_live_connections 3", samples)
+
+    def test_native_rewrite_falls_back_without_the_block(self):
+        out = self._body()
+        samples = self._samples(out)
+        self.assertIn("tfexporter_live_decode_tps 20.0", samples)
+        self.assertIn("tfexporter_live_decode_tps_source 0", samples)
+        self.assertIn("tfexporter_live_decode_tps_derived 20.0", samples)
+        # the engine-only series must be absent as SAMPLES (their name may legitimately
+        # appear inside another gauge's HELP text)
+        self.assertFalse([s for s in samples
+                          if s.startswith("tfexporter_engine_prefill_lastjob_tps ")])
+        self.assertFalse([s for s in samples if s.startswith("tfexporter_prefilling ")])
+        self.assertFalse([s for s in samples if s.startswith("tfexporter_queue_waiting ")])
+        self.assertFalse([s for s in samples
+                          if s.startswith("tfexporter_live_connections ")])
+
+    def test_native_rewrite_falls_back_when_the_block_is_stale(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 137.4}},
+                                  self.m.time.time() - self.m.LIVE_FRESH_S - 5)
+        out = self._body()
+        samples = self._samples(out)
+        self.assertIn("tfexporter_live_decode_tps 20.0", samples)
+        self.assertIn("tfexporter_live_decode_tps_source 0", samples)
+
+    def test_the_two_emitters_agree(self):
+        self.m.update_engine_live({"live": {"decode_tokens_per_second": 42.5}},
+                                  self.m.time.time())
+        samples = self._samples(self._body())
+        rows = self.m.self_status_lines(1)
+        self.assertIn("tfexporter_live_decode_tps 42.5", samples)
+        self.assertIn("tfexporter_live_decode_tps 42.5", rows)
+
+    # The old health-profile engine has no /health live block, so its only live source
+    # stays the live completion-counter diff; when it does grow a block it must upgrade.
+    HEALTH_TEXT = (
+        "# HELP tensorfold_health:uptime_seconds up\n"
+        "# TYPE tensorfold_health:uptime_seconds gauge\n"
+        "tensorfold_health:uptime_seconds 100\n"
+        "tensorfold:generation_tokens_total 300\n"
+        "tensorfold:completion_tokens_total 320\n"
+        "tensorfold:prompt_tokens_total 900\n"
+        "tensorfold:time_to_first_token_seconds_sum 3\n"
+        "tensorfold:requests_running 2\n"
+    )
+
+    def test_health_profile_keeps_the_counter_diff_when_no_live_block(self):
+        m = self.m
+        m.STATE.live_tps = 11.0
+        samples = self._samples(m.rewrite(self.HEALTH_TEXT).decode("utf-8", "replace"))
+        self.assertIn("tfexporter_engine_profile 0", samples)
+        self.assertIn("tfexporter_live_decode_tps 11.0", samples)
+        self.assertIn("tfexporter_live_decode_tps_source 0", samples)
+        self.assertIn("tfexporter_live_decode_tps_derived 11.0", samples)
+
+    def test_prefill_help_names_the_denominator_the_code_actually_uses(self):
+        # zig-v1 divides by the engine's prefill-seconds counter (no queue time);
+        # the health/python path divides by TTFT sums (queue included). The HELP text
+        # must not claim the other one.
+        out = self._body()
+        help_line = [ln for ln in out.splitlines()
+                     if ln.startswith("# HELP tfexporter_live_prefill_tps ")]
+        self.assertEqual(len(help_line), 1)
+        self.assertIn("tensorfold_prefill_seconds_total", help_line[0])
+        self.assertNotIn("which includes queue time", help_line[0])
+
+        health_out = self.m.rewrite(self.HEALTH_TEXT).decode("utf-8", "replace")
+        help_line = [ln for ln in health_out.splitlines()
+                     if ln.startswith("# HELP tfexporter_live_prefill_tps ")]
+        self.assertEqual(len(help_line), 1)
+        self.assertIn("time_to_first_token_seconds_sum", help_line[0])
+        self.assertIn("includes queue time", help_line[0])
+
+    def test_health_profile_upgrades_when_the_block_appears(self):
+        m = self.m
+        m.STATE.live_tps = 11.0
+        m.update_engine_live({"live": {"decode_tokens_per_second": 55.5}},
+                             m.time.time())
+        samples = self._samples(m.rewrite(self.HEALTH_TEXT).decode("utf-8", "replace"))
+        self.assertIn("tfexporter_live_decode_tps 55.5", samples)
+        self.assertIn("tfexporter_live_decode_tps_source 1", samples)
+        self.assertIn("tfexporter_live_decode_tps_derived 11.0", samples)
 
 
 if __name__ == "__main__":
