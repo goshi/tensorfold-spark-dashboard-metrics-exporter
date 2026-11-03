@@ -3,6 +3,64 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] - 2026-11-03
+
+### Added
+- **The engine's decode rounds reach the dashboard.** `vllm_spec_decode_num_drafts_total`
+  is now fed by `tensorfold:decode_rounds_total` (measured: 342 825 after ~14 h of
+  traffic). Until now this family read `/health`'s `rounds_total` - a field the flash17
+  pin H engine has never published - so the series was simply absent from the endpoint.
+- **Device and process memory, straight from the engine.**
+  `tfexporter_engine_device_memory_bytes{kind="active|peak|pinned"}` and
+  `tfexporter_engine_process_resident_bytes{kind="rss|anon|file|shmem|peak"}`, renamed
+  1:1 from `tensorfold:device_memory_bytes`, `…_peak_bytes`, `…pinned_memory_bytes` and
+  the five `tensorfold:process_resident_*_bytes` families. `peak` is the allocator's
+  high-water mark since engine start: the engine only resets it when `/health` is called
+  with `?reset_peak=1`, and this exporter never does.
+- **Client-abort and in-flight-token visibility.**
+  `tfexporter_client_disconnections_total` (streams the engine dropped mid-reply - the
+  number to watch when a subscriber vanishes) and `tfexporter_generation_tokens_running`
+  (tokens produced by requests still in flight, prompts excluded).
+- **Engine identity and capacity from `/health`.** `tfexporter_engine_warming`
+  (1 while graphs/pools are still warming), `tfexporter_engine_lanes` (`/health`'s
+  `max_batch_size` - the hard cap on concurrency, so `vllm_num_requests_running` pinned
+  at this value means saturated, not slow) and `tfexporter_engine_info{version,backend,model}`.
+
+### Fixed
+- `tfexporter_engine_info` was emitted twice - a bare `…_info 1` next to the labelled
+  sample, which reads as two engines on one host. Caught by the live spare-port run; the
+  unit suite had passed because it inspected the appended rows in isolation. A test now
+  pins "exactly one sample, the labelled one".
+
+### Notes
+- Absence stays absence: an unmapped schema, a missing family or a malformed value
+  produces no series rather than a zero. The per-schema family list (`EXTRA_SOURCES`)
+  contains only what was scraped from a live engine - the underscore `zig-v1` twin is
+  deliberately not listed until someone verifies it on a node.
+- Emitted from one place (`engine_native_series()`), and any family the rewritten body
+  already carries is skipped, so a native sample can never be shadowed or duplicated by
+  our rename.
+- The pin H engine exposes **no** cached-tokens or prefix-cache counter of any name
+  (verified by scraping every family it publishes), so `tfexporter_cache_hit_ratio`,
+  `tfexporter_cached_tokens_total`, `vllm_prefix_cache_hits_total` and
+  `vllm_prefix_cache_queries_total` are absent on this engine by design - prefix reuse
+  is real but only visible in the engine's own request log.
+  `vllm_request_queue_time_seconds_*` is not emitted on this schema at all (no queue-time
+  source exists); `vllm_num_requests_swapped` remains a documented zero, since the engine
+  preempts rather than swaps and counts that separately in `tensorfold:preemptions_total`.
+- `vllm_num_preemptions_total` was already native (direct rename of
+  `tensorfold:preemptions_total`); it stayed 0 through a 6-request burst against 4 lanes,
+  which is what the engine reports, not what we assume.
+
+### Tests
+- 16 new tests (72 -> 88): parsing per schema, stale extras cleared on a schema change,
+  malformed values ignored, the rounds->drafts rename, no zero-filling when a family is
+  missing, the body's own sample never shadowed, memory kinds labelled and a missing kind
+  simply absent, resident breakdown, disconnections and running tokens, warming/lanes
+  (including rejecting a `bool` lane count), label escaping of quotes, backslashes and
+  newlines, `None` /health, the single `engine_info` sample, and an integration check that
+  every appended sample has its `# TYPE` line before it.
+
 ## [1.3.0] - 2026-11-03
 
 ### Added

@@ -88,13 +88,34 @@ PREFIXES = ("tensorfold_health:", "tensorfold:")
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # How long an engine /health "live" reading stays believable. The engine keeps its own
 # 2 s sliding window (core/lane_host.zig: tokens over window_ns, divided by 2.0), so a
 # few seconds of slack covers the poll gap; past it a dead engine must not keep the
 # tile warm, and we fall back to the exporter-derived window.
 LIVE_FRESH_S = float(os.environ.get("TF_LIVE_FRESH_S", "5"))
+
+# Families the engine already counts that the vLLM namespace never sees. Only schemas we
+# have scraped are listed: an invented name would silently produce no series, and a wrong
+# one worse - it would look like the engine stopped counting. The flash17 pin H engine
+# publishes COLON names (schema python-v1); its underscore twin (zig-v1) is not listed
+# because that family set was never verified on a live node.
+EXTRA_SOURCES = {
+    "python-v1": {
+        "rounds": ("tensorfold:decode_rounds_total",),
+        "dev_mem": ("tensorfold:device_memory_bytes",),
+        "dev_mem_peak": ("tensorfold:device_memory_peak_bytes",),
+        "pinned_mem": ("tensorfold:pinned_memory_bytes",),
+        "rss": ("tensorfold:process_resident_bytes",),
+        "rss_anon": ("tensorfold:process_resident_anon_bytes",),
+        "rss_file": ("tensorfold:process_resident_file_bytes",),
+        "rss_shmem": ("tensorfold:process_resident_shmem_bytes",),
+        "rss_peak": ("tensorfold:process_resident_peak_bytes",),
+        "disconnects": ("tensorfold:client_disconnections_total",),
+        "gen_running": ("tensorfold:generation_tokens_running",),
+    },
+}
 
 # Direct base-name renames (after stripping the tensorfold: prefix).
 # The "requests_running"/"requests_waiting" mirrors map to the same vLLM
@@ -175,6 +196,10 @@ class State:
         self.queue_waiting = None
         self.live_connections = None
         self.prefill_lastjob = None
+        # v1.4.0: native families the vLLM namespace has no name for, plus the /health
+        # identity block (warming / lanes / version), both parsed per poll.
+        self.extras = {}
+        self.health_info = {}
         # native profile: trailing window of finished counters, held rates
         self.window = []        # (ts, gen_fin, dec_s, prompt_fin, ttft_s)
         self.rate_decode = 0.0  # held true decode tps (delta gen / delta dec_s)
@@ -288,6 +313,134 @@ def detect_schema(text):
     if "tensorfold:generation_tokens_total" in text:
         return "python-v1"
     return "unknown"
+
+
+def _label_safe(text):
+    """Keep a free-form engine string from breaking the exposition format."""
+    return str(text).replace("\\", "").replace('"', "").replace("\n", " ").strip()[:96]
+
+
+def update_engine_extras(text):
+    """Collect the native families listed in EXTRA_SOURCES for the current schema.
+
+    Values are kept as the engine gave them; a family that is absent stays absent so the
+    emitter can omit it instead of inventing a zero.
+    """
+    wanted = EXTRA_SOURCES.get(STATE.schema)
+    found = {}
+    if wanted:
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            head = line.split(" ", 1)[0]
+            base = head.split("{", 1)[0]
+            for key, names in wanted.items():
+                if base in names and key not in found:
+                    try:
+                        found[key] = float(line.rsplit(" ", 1)[1])
+                    except (IndexError, ValueError):
+                        pass
+    with STATE.lock:
+        STATE.extras = found
+    return found
+
+
+def update_health_info(health):
+    """The /health identity and readiness fields: what engine, how many lanes, warming?"""
+    info = {}
+    if isinstance(health, dict):
+        for src, dst in (("warming", "warming"), ("max_batch_size", "lanes"),
+                         ("version", "version"), ("backend", "backend"),
+                         ("model", "model")):
+            if src in health:
+                info[dst] = health[src]
+    with STATE.lock:
+        STATE.health_info = info
+    return info
+
+
+def engine_native_series(existing_names):
+    """Native engine families the adapter has no name for, as (name, value, type, doc).
+
+    Emitted from ONE place: the live gauges taught us that a second emitter with its own
+    opinion is how a dashboard ends up showing a stale or duplicated number. A name the
+    body already carries is skipped, so this can never shadow the engine's own sample.
+    """
+    with STATE.lock:
+        extras = dict(STATE.extras)
+        info = dict(STATE.health_info)
+    rows = []
+
+    def add(name, value, kind, doc):
+        if name in existing_names:
+            return
+        rows.append((name, value, kind, doc))
+
+    rounds = extras.get("rounds")
+    if rounds is not None:
+        # The engine counts decode rounds; the adapter's draft-count family is the only
+        # place a dashboard will show them. This replaces the old read of /health
+        # "rounds_total", a field the pin H engine has never published.
+        add("vllm_spec_decode_num_drafts_total", str(int(rounds)), "counter",
+            "Decode rounds the engine has run (tensorfold:decode_rounds_total); each "
+            "round advances every live stream by one drafted/verified step.")
+
+    mem = [("active", "dev_mem"), ("peak", "dev_mem_peak"), ("pinned", "pinned_mem")]
+    got_mem = [(kind, extras[key]) for kind, key in mem if extras.get(key) is not None]
+    if got_mem and "tfexporter_engine_device_memory_bytes" not in existing_names:
+        rows.append(("__meta__", "tfexporter_engine_device_memory_bytes", "gauge",
+                     "Device memory the engine's allocator reports, in bytes: active = "
+                     "in use, peak = high-water since engine start (reset only by an "
+                     "explicit /health?reset_peak=1, which this exporter never calls), "
+                     "pinned = host memory pinned for the device."))
+        for kind, v in got_mem:
+            rows.append(("__sample__", ('tfexporter_engine_device_memory_bytes{kind="%s"}'
+                                        % kind) + " " + str(int(v)), None, None))
+
+    rss = [("rss", "rss"), ("anon", "rss_anon"), ("file", "rss_file"),
+           ("shmem", "rss_shmem"), ("peak", "rss_peak")]
+    got = [(kind, extras[key]) for kind, key in rss if extras.get(key) is not None]
+    if got and "tfexporter_engine_process_resident_bytes" not in existing_names:
+        rows.append(("__meta__", "tfexporter_engine_process_resident_bytes", "gauge",
+                     "Engine process RSS breakdown in bytes (anon/file/shmem, total and "
+                     "high-water peak), straight from the engine's own counters."))
+        for kind, v in got:
+            rows.append(("__sample__", ('tfexporter_engine_process_resident_bytes{kind="%s"}'
+                                        % kind) + " " + str(int(v)), None, None))
+
+    d = extras.get("disconnects")
+    if d is not None:
+        add("tfexporter_client_disconnections_total", str(int(d)), "counter",
+            "Client connections dropped by the engine mid-stream (aborts, dropped SSE "
+            "subscribers); pairs with tfexporter_prefilling when a stream dies early.")
+    g = extras.get("gen_running")
+    if g is not None:
+        add("tfexporter_generation_tokens_running", str(int(g)), "gauge",
+            "Tokens generated so far by requests still in flight (excludes prompts).")
+
+    if "warming" in info:
+        add("tfexporter_engine_warming",
+            "1" if info["warming"] in (True, 1, "true") else "0", "gauge",
+            "1 while the engine is still warming its graphs/pools and would not serve a "
+            "prompt at speed; 0 once ready.")
+    if isinstance(info.get("lanes"), (int, float)) and not isinstance(info.get("lanes"), bool):
+        add("tfexporter_engine_lanes", str(int(info["lanes"])), "gauge",
+            "Engine lanes = the hard cap on concurrent requests (/health max_batch_size). "
+            "Compare with vllm_num_requests_running: pinned at this number means the "
+            "engine is saturated, not slow.")
+    version = _label_safe(info.get("version", ""))
+    backend = _label_safe(info.get("backend", ""))
+    model = _label_safe(info.get("model", "") or MODELS_CACHE.get("model_id", ""))
+    if (version or backend) and "tfexporter_engine_info" not in existing_names:
+        # One sample only, the labelled one: a bare tfexporter_engine_info 1 next to the
+        # labelled form made the series read as two different engines (caught live, not
+        # in the unit suite, which only inspected the rows in isolation).
+        rows.append(("__meta__", "tfexporter_engine_info", "gauge",
+                     "Constant 1; the labels carry what the engine reported about itself "
+                     "over /health, so a fleet can be read without ssh."))
+        rows.append(("__sample__", 'tfexporter_engine_info{version="%s",backend="%s",'
+                     'model="%s"} 1' % (version, backend, model), None, None))
+    return rows
 
 
 def update_engine_live(health, now):
@@ -1149,6 +1302,9 @@ def poll_loop():
                     STATE.window = []
                     STATE.rate_decode = 0.0
                     STATE.rate_prefill = 0.0
+            # Collected for every schema: a schema change must clear the previous
+            # engine's numbers rather than keep serving them as if they were current.
+            update_engine_extras(text)
             if native:
                 update_native_stats(text, now)
                 update_models_cache()
@@ -1162,6 +1318,7 @@ def poll_loop():
                 _, hbody, _ = fetch_upstream("/health")
                 STATE.health = json.loads(hbody.decode("utf-8", "replace"))
                 update_engine_live(STATE.health, now)
+                update_health_info(STATE.health)
             except (urllib.error.URLError, OSError, ValueError):
                 pass
             try:
@@ -1216,11 +1373,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(502, f"upstream unavailable: {err}\n".encode(),
                            "text/plain; charset=utf-8")
             return
-        extra = self._v4_gauges()
+        extra = self._v4_gauges(body)
         self._send(200, body + extra, "text/plain; version=0.0.4; charset=utf-8")
 
-    def _v4_gauges(self):
+    def _v4_gauges(self, body=b""):
         NL = chr(10)
+        # Names the rewritten body already carries: a native sample from the engine always
+        # wins over our rename, so the series below must never shadow or duplicate it.
+        existing = set()
+        for line in body.decode("utf-8", "replace").splitlines():
+            if line and not line.startswith("#"):
+                existing.add(line.split("{", 1)[0].split(" ", 1)[0])
         with STATE.lock:
             # vllm-v1: the passthrough body already carries the renamed
             # families - never append the raw colon exposition.
@@ -1253,6 +1416,15 @@ class Handler(BaseHTTPRequestHandler):
             if v is None:
                 continue
             out.append(("# HELP " + name + " " + doc + NL + "# TYPE " + name + " gauge" + NL + name + " " + str(v) + NL).encode())
+        for row in engine_native_series(existing):
+            head, a, b, c = row
+            if head == "__meta__":
+                out.append(("# HELP " + a + " " + c + NL + "# TYPE " + a + " " + b + NL).encode())
+            elif head == "__sample__":
+                out.append((a + NL).encode())
+            else:
+                out.append(("# HELP " + head + " " + c + NL + "# TYPE " + head + " " + b +
+                            NL + head + " " + a + NL).encode())
         return b"".join(out)
 
     def _proxy(self):

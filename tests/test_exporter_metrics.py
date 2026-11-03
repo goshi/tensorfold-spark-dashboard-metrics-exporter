@@ -995,5 +995,205 @@ class NativeRewriteLiveRateTests(unittest.TestCase):
         self.assertIn("tfexporter_live_decode_tps_derived 11.0", samples)
 
 
+class EngineNativeSeriesTests(unittest.TestCase):
+    """v1.4.0: EXTRA_SOURCES + /health identity, emitted from one place."""
+
+    MEM_TEXT = (
+        "tensorfold:prompt_tokens_total 900\n"
+        "tensorfold:generation_tokens_total 300\n"
+        "tensorfold:requests_running 2\n"
+        "tensorfold:decode_rounds_total 342091\n"
+        "tensorfold:device_memory_bytes 108885425172\n"
+        "tensorfold:device_memory_peak_bytes 111558472468\n"
+        "tensorfold:pinned_memory_bytes 0\n"
+        "tensorfold:process_resident_bytes 5356781568\n"
+        "tensorfold:process_resident_anon_bytes 3459026944\n"
+        "tensorfold:process_resident_file_bytes 372236288\n"
+        "tensorfold:process_resident_shmem_bytes 1525518336\n"
+        "tensorfold:process_resident_peak_bytes 6520332288\n"
+        "tensorfold:client_disconnections_total 2\n"
+        "tensorfold:generation_tokens_running 427\n"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_exporter()
+
+    def setUp(self):
+        st = self.m.STATE
+        for name, value in (("schema", "python-v1"), ("extras", {}), ("health_info", {}),
+                            ("window", []), ("rate_decode", 0.0), ("rate_prefill", 0.0),
+                            ("restarts", 0), ("stalled", 0), ("last_stalled", 0),
+                            ("last_fatal", 0), ("last_inflight", 0), ("last_rejected", None),
+                            ("last_cached", None), ("cache_ratio", None), ("mem_gib", 6.0),
+                            ("native_raw", b""), ("probe_hist", {}), ("offsets", {}),
+                            ("live_engine", None), ("live_engine_ts", 0.0),
+                            ("queue_waiting", None), ("live_connections", None),
+                            ("prefill_lastjob", None), ("live_tps", 0.0)):
+            setattr(st, name, value)
+        self.m.MODELS_CACHE["model_id"] = "DeepSeek-V4.1-Flash-TF"
+
+    def _rows(self, existing=()):
+        return self.m.engine_native_series(set(existing))
+
+    def _sample_lines(self, rows):
+        out = []
+        for head, a, b, c in rows:
+            if head == "__sample__":
+                out.append(a)
+            elif head == "__meta__":
+                continue
+            else:
+                out.append("%s %s" % (head, a))
+        return out
+
+    # --- parsing ---
+
+    def test_extras_are_parsed_for_python_v1(self):
+        found = self.m.update_engine_extras(self.MEM_TEXT)
+        self.assertEqual(found["rounds"], 342091.0)
+        self.assertEqual(found["dev_mem"], 108885425172.0)
+        self.assertEqual(found["disconnects"], 2.0)
+        self.assertEqual(found["gen_running"], 427.0)
+        self.assertEqual(self.m.STATE.extras, found)
+
+    def test_extras_empty_for_an_unmapped_schema(self):
+        self.m.update_engine_extras(self.MEM_TEXT)          # python-v1 -> populated
+        self.assertTrue(self.m.STATE.extras)
+        self.m.STATE.schema = "vllm-v1"
+        self.assertEqual(self.m.update_engine_extras(self.MEM_TEXT), {})
+        self.assertEqual(self.m.STATE.extras, {}, "stale numbers must not survive a schema change")
+
+    def test_malformed_value_is_ignored_not_stored(self):
+        self.m.update_engine_extras("tensorfold:decode_rounds_total not-a-number\n")
+        self.assertNotIn("rounds", self.m.STATE.extras)
+
+    # --- the dead drafts series comes back from the engine's own counter ---
+
+    def test_drafts_total_comes_from_decode_rounds(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        self.assertIn("vllm_spec_decode_num_drafts_total 342091", self._sample_lines(self._rows()))
+
+    def test_no_rounds_no_series_rather_than_a_zero(self):
+        self.m.update_engine_extras("tensorfold:prompt_tokens_total 900\n")
+        self.assertFalse([s for s in self._sample_lines(self._rows())
+                          if s.startswith("vllm_spec_decode_num_drafts_total")])
+
+    def test_an_existing_engine_sample_is_never_shadowed(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        rows = self._rows(existing={"vllm_spec_decode_num_drafts_total"})
+        self.assertFalse([s for s in self._sample_lines(rows)
+                          if s.startswith("vllm_spec_decode_num_drafts_total")])
+
+    # --- memory / pressure ---
+
+    def test_device_memory_kinds_are_labelled(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        samples = self._sample_lines(self._rows())
+        self.assertIn('tfexporter_engine_device_memory_bytes{kind="active"} 108885425172', samples)
+        self.assertIn('tfexporter_engine_device_memory_bytes{kind="peak"} 111558472468', samples)
+        self.assertIn('tfexporter_engine_device_memory_bytes{kind="pinned"} 0', samples)
+        metas = [r for r in self._rows() if r[0] == "__meta__"
+                 and r[1] == "tfexporter_engine_device_memory_bytes"]
+        self.assertEqual(len(metas), 1, "one HELP/TYPE block per family")
+
+    def test_missing_pinned_kind_is_simply_absent(self):
+        self.m.update_engine_extras("tensorfold:device_memory_bytes 100\n")
+        samples = self._sample_lines(self._rows())
+        self.assertIn('tfexporter_engine_device_memory_bytes{kind="active"} 100', samples)
+        self.assertFalse([s for s in samples if 'kind="pinned"' in s])
+
+    def test_resident_breakdown_is_exported(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        samples = self._sample_lines(self._rows())
+        for kind, value in (("rss", 5356781568), ("anon", 3459026944), ("file", 372236288),
+                            ("shmem", 1525518336), ("peak", 6520332288)):
+            self.assertIn('tfexporter_engine_process_resident_bytes{kind="%s"} %d' % (kind, value),
+                          samples)
+
+    def test_disconnections_and_running_tokens(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        samples = self._sample_lines(self._rows())
+        self.assertIn("tfexporter_client_disconnections_total 2", samples)
+        self.assertIn("tfexporter_generation_tokens_running 427", samples)
+
+    # --- /health identity and readiness ---
+
+    def test_warming_is_a_gauge_and_absent_means_absent(self):
+        self.m.update_health_info({"warming": True, "max_batch_size": 4,
+                                   "version": "1.1.8", "backend": "cuda",
+                                   "model": "DeepSeek-V4.1-Flash-TF"})
+        samples = self._sample_lines(self._rows())
+        self.assertIn("tfexporter_engine_warming 1", samples)
+        self.assertIn("tfexporter_engine_lanes 4", samples)
+        self.assertEqual(self.m.STATE.health_info["version"], "1.1.8")
+        self.m.update_health_info({"status": "ok"})
+        self.assertFalse([s for s in self._sample_lines(self._rows())
+                          if s.startswith("tfexporter_engine_warming")])
+
+    def test_engine_info_labels_carry_version_and_cannot_break_the_format(self):
+        self.m.update_health_info({"version": '1.1.8"', "backend": "cu\nd a",
+                                   "model": 'Deep"Seek'})
+        samples = self._sample_lines(self._rows())
+        info = [s for s in samples if s.startswith("tfexporter_engine_info{")]
+        self.assertEqual(len(info), 1, info)
+        # The quotes/backslash/newline the caller supplied are gone: exactly three
+        # label pairs of our own delimiters survive, and nothing else.
+        self.assertEqual(info[0].count('"'), 6, info[0])
+        self.assertNotIn("\\", info[0])
+        self.assertEqual(info[0],
+                         'tfexporter_engine_info{version="1.1.8",backend="cu d a",'
+                         'model="DeepSeek"} 1')
+
+    def test_engine_info_is_emitted_exactly_once(self):
+        # A bare sample plus the labelled one reads as two engines on one host.
+        self.m.update_health_info({"version": "1.1.8", "backend": "cuda",
+                                   "model": "DeepSeek-V4.1-Flash-TF"})
+        info = [s for s in self._sample_lines(self._rows())
+                if s.startswith("tfexporter_engine_info")]
+        self.assertEqual(len(info), 1, info)
+        self.assertTrue(info[0].startswith("tfexporter_engine_info{"), info[0])
+
+    def test_a_bool_lane_count_is_not_a_lane_count(self):
+        self.m.update_health_info({"max_batch_size": True})
+        self.assertFalse([s for s in self._sample_lines(self._rows())
+                          if s.startswith("tfexporter_engine_lanes")])
+
+    def test_health_info_survives_a_non_dict_health(self):
+        self.m.update_health_info({"warming": False})
+        self.m.update_health_info(None)
+        self.assertEqual(self.m.STATE.health_info, {})
+
+    # --- integration through the real emitter ---
+
+    def test_v4_gauges_appends_native_series_once(self):
+        self.m.update_engine_extras(self.MEM_TEXT)
+        self.m.update_health_info({"warming": False, "max_batch_size": 4,
+                                   "version": "1.1.8", "backend": "cuda"})
+        body = ("# TYPE vllm_prompt_tokens_total counter\nvllm_prompt_tokens_total 900\n"
+                "# TYPE tfexporter_engine_lanes gauge\ntfexporter_engine_lanes 9\n").encode()
+        handler = object.__new__(self.m.Handler)
+        out = handler._v4_gauges(body).decode("utf-8", "replace")
+        self.assertIn("vllm_spec_decode_num_drafts_total 342091", out)
+        self.assertIn('tfexporter_engine_device_memory_bytes{kind="active"}', out)
+        # the body's own sample wins: _v4_gauges returns only what it APPENDS, and it
+        # must not append a second lane line over the one the body already carries
+        self.assertFalse([ln for ln in out.splitlines()
+                          if ln.startswith("tfexporter_engine_lanes ")])
+        self.assertIn("tfexporter_engine_lanes 9", body.decode())
+        # and every sample line has its TYPE line before it
+        lines = out.splitlines()
+        seen_types = set()
+        for ln in lines:
+            if ln.startswith("# TYPE "):
+                seen_types.add(ln.split()[2])
+            elif ln and not ln.startswith("#"):
+                base = ln.split("{", 1)[0].split(" ", 1)[0]
+                if base.startswith(("tfexporter_engine_", "vllm_spec_decode", "tfexporter_client")):
+                    self.assertIn(base, seen_types, "sample before its TYPE for " + base)
+
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

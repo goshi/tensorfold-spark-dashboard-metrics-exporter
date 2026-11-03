@@ -146,9 +146,13 @@ Self-observability: `tfexporter_engine_schema_info`, `tfexporter_live_decode_tps
 (+ `_source`, `_derived`), `tfexporter_live_prefill_tps`,
 `tfexporter_engine_prefill_lastjob_tps`, `tfexporter_prefilling`,
 `tfexporter_queue_waiting`, `tfexporter_live_connections`,
-`tfexporter_cache_hit_ratio` (600 s window), `tfexporter_mem_available_gib`,
-`tfexporter_engine_restarts_total`, `tfexporter_upstream_ok`,
-`tfexporter_upstream_lag_seconds`.
+`tfexporter_engine_device_memory_bytes{kind}`,
+`tfexporter_engine_process_resident_bytes{kind}`,
+`tfexporter_client_disconnections_total`, `tfexporter_generation_tokens_running`,
+`tfexporter_engine_warming`, `tfexporter_engine_lanes`, `tfexporter_engine_info`,
+`tfexporter_cache_hit_ratio` (600 s window, only when the engine counts cached tokens),
+`tfexporter_mem_available_gib`, `tfexporter_engine_restarts_total`,
+`tfexporter_upstream_ok`, `tfexporter_upstream_lag_seconds`.
 
 **Graceful degradation:** after an upstream failure the last good snapshot is
 served for 10 seconds, then the exporter answers `502`. `/healthz` reflects
@@ -172,6 +176,32 @@ The engine publishes a `live` object in `/health`:
 | `tfexporter_engine_prefill_lastjob_tps` | `live.prefill_tokens_per_second` | **informational**: one job's figure, timed from admission, last-writer-wins |
 | `tfexporter_prefilling` | same field > 0 | coarse "a prompt pass just happened" |
 | `tfexporter_queue_waiting`, `tfexporter_live_connections` | same `/health` snapshot | consistent with the decode tile |
+
+## Native engine counters the vLLM namespace has no name for
+
+The engine counts more than the vLLM family set can express. These are 1:1 renames of
+families the engine publishes - not estimates, and never zero-filled:
+
+| Series | Engine family | Why it matters |
+|--------|---------------|----------------|
+| `vllm_spec_decode_num_drafts_total` | `tensorfold:decode_rounds_total` | draft/acceptance panels were blank; the old source was a `/health` field this engine never had |
+| `tfexporter_engine_device_memory_bytes{kind="active\|peak\|pinned"}` | `tensorfold:device_memory_bytes`, `…_peak_bytes`, `tensorfold:pinned_memory_bytes` | allocator footprint; `peak` resets only on `/health?reset_peak=1`, which this exporter never calls |
+| `tfexporter_engine_process_resident_bytes{kind="rss\|anon\|file\|shmem\|peak"}` | `tensorfold:process_resident_*_bytes` | separates the anon/shmem split that decides whether the memory floor is real |
+| `tfexporter_client_disconnections_total` | `tensorfold:client_disconnections_total` | streams the engine dropped mid-reply |
+| `tfexporter_generation_tokens_running` | `tensorfold:generation_tokens_running` | tokens from requests still in flight |
+| `tfexporter_engine_warming` | `/health` `warming` | 1 while graphs/pools warm |
+| `tfexporter_engine_lanes` | `/health` `max_batch_size` | concurrency cap; `vllm_num_requests_running` stuck here = saturated, not slow |
+| `tfexporter_engine_info{version,backend,model}` | `/health` `version`/`backend`/`model` | fleet inventory without ssh |
+
+Anything the engine does not count stays unexported. On the flash17 pin H engine that
+includes every prefix-cache figure - it publishes no cached-tokens counter under any
+name - so `tfexporter_cache_hit_ratio`, `tfexporter_cached_tokens_total` and
+`vllm_prefix_cache_hits_total` are absent there. `vllm_num_requests_swapped` is emitted
+as a documented zero (the engine preempts rather than swaps, and does count it in
+`tensorfold:preemptions_total`, renamed to `vllm_num_preemptions_total`);
+`vllm_request_queue_time_seconds_*` is not emitted at all on this schema, because no
+queue-time source exists. Reading `--` on those panels means "no source", not
+"no activity".
 
 Two consequences worth knowing before you graph them. First, the exporter
 applies no smoothing of its own on top of the engine's window - stacking a
