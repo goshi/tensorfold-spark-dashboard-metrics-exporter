@@ -182,8 +182,10 @@ TP2 pair it read 197/603/1458 tok/s while that engine served a 49K-token prompt
 at ~1.9K tok/s, because it is written once per finished pass and includes the
 time spent waiting for a lane. Our derived prefill rate is an aggregate over
 the window, so with concurrent requests and prefix-cache hits it can exceed any
-single request's rate; for honest per-request distributions use the engine's
-own `vllm_request_prefill_seconds` histogram instead.
+single request's rate; for honest per-request latency distributions use the
+engine's own histograms instead - `vllm_time_to_first_token_seconds` (time to
+first token, queue included on this schema) and
+`vllm_request_time_per_output_token_seconds`.
 
 ## Requirements
 
