@@ -53,6 +53,9 @@ dashboard shows `--` rather than a made-up number.
 - **`vllm-v1`** — a native vLLM engine (`vllm:prompt_tokens_total{engine=…,model_name=…}`),
   e.g. the exlr8 GLM build. Passed through: colon families renamed 1:1 to
   underscore names, labels preserved, non-vLLM families dropped.
+- **`velo-v1`** — `velogb10_prompt_tokens_total` present: the veloGB10 GB10
+  engine (EXL3 packs, MTP spec-decode, per-lane KV pre-allocation). See
+  "Metric mapping (velo-v1 engine)" below.
 - **`zig-v1`** — underscore families (`tensorfold_prompt_tokens_total{model=…}`),
   the flash17 Zig engine. Primary target: raw families + `/health` JSON
   (in-flight, spec-decode counters, streams).
@@ -157,6 +160,31 @@ Self-observability: `tfexporter_engine_schema_info`, `tfexporter_live_decode_tps
 **Graceful degradation:** after an upstream failure the last good snapshot is
 served for 10 seconds, then the exporter answers `502`. `/healthz` reflects
 upstream liveness.
+
+## Metric mapping (velo-v1 engine — veloGB10)
+
+veloGB10 exposes `velogb10_*` families only and no `/health` `live` block, so
+the adapter synthesizes the vLLM-named series the dashboard expects. Every
+synthesis is documented in its own HELP text; the provenance in one place:
+
+| Emitted | Source | Honest caveat |
+|---|---|---|
+| `vllm_prefix_cache_hits_total` | `velogb10_prompt_tokens_cached_total` | direct rename |
+| `vllm_prefix_cache_queries_total` | `velogb10_prompt_tokens_total` | zig convention: every prompt token is a query |
+| `vllm_e2e_request_latency_seconds*` | `velogb10_request_duration_seconds*` | direct rename, buckets passed through |
+| `vllm_spec_decode_num_draft/accepted_tokens_total` | `velogb10_spec_draft/accepted_tokens_total` | direct rename |
+| `vllm_request_time_per_output_token_seconds_sum/_count` | `request_duration_seconds_sum − time_to_first_token_seconds_sum`, completion tokens | engine has no decode-seconds counter; both totals share the finished-request population (cross-checked vs client measurement: 0.4%) |
+| `vllm_inter_token_latency_seconds_sum/_count` | same pair as above | vLLM-named alias; per-request, not per-token samples |
+| `vllm_*_latency_seconds_bucket` (ITL/TPOT, SLO goodput) | `velogb10_decode_tokens_per_second_bucket` | exact reciprocal TPOT=1/tps of a per-request measurement — a change of variable, not a modeled distribution; bucket-edge requests count as SLO misses |
+| `vllm_iteration_tokens_total_sum/_count` (Batch tile) | `generation_tokens_total / scheduler_steps_total` | tokens per decode step; with MTP the effective step width |
+| `vllm_request_queue_time_seconds_sum/_count` (Queue tile) | time-integral of `velogb10_requests_waiting` ÷ completions | **Little's law** over the exporter's 2s poll timeline; the engine publishes no queue-seconds counter; window opens at exporter attach |
+| `vllm_kv_cache_usage_perc` | `kv_positions_used / capacity` | **ratio 0..1** — the dashboard multiplies by 100 |
+| `tfexporter_mem_available_gib` | `velogb10_mem_available_bytes` | engine host's reading, correct for remote exporters |
+
+Functional gap kept honest: veloGB10 never emits per-request queue seconds,
+so Queue is a poll-sampled estimate (documented in HELP), not an engine
+measurement. The engine counts decode rounds as
+`velogb10_spec_rounds_total`; it is surfaced natively.
 
 ## Live rates: engine first, ours as fallback
 

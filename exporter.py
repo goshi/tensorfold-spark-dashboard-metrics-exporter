@@ -84,11 +84,15 @@ POLL = float(os.environ.get("TF_POLL_INTERVAL", "2"))
 
 SAMPLE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)(?:\s+\S+)?$")
 META_RE = re.compile(r"^# (HELP|TYPE)\s+(\S+)(?:\s(.*))?$")
-PREFIXES = ("tensorfold_health:", "tensorfold:")
+PREFIXES = ("tensorfold_health:", "tensorfold:", "velogb10_")
+# The velogb10_ strip (v1.5.0) lets the veloGB10 engine land in the same DIRECT /
+# health-counter paths as the TensorFold engines: velogb10_prompt_tokens_total
+# post-strip reads exactly like the Python engine's prompt_tokens_total. No other
+# schema emits a velogb10_-prefixed family, so the strip is inert for them.
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.4.0"
+VERSION = "1.5.5"
 
 # How long an engine /health "live" reading stays believable. The engine keeps its own
 # 2 s sliding window (core/lane_host.zig: tokens over window_ns, divided by 2.0), so a
@@ -115,6 +119,22 @@ EXTRA_SOURCES = {
         "disconnects": ("tensorfold:client_disconnections_total",),
         "gen_running": ("tensorfold:generation_tokens_running",),
     },
+    # veloGB10 (TP=1 EXL3 engine). Family names verified against a live
+    # v0.7.8 /metrics exposition; an invented name would silently vanish.
+    "velo-v1": {
+        "rounds": ("velogb10_spec_rounds_total",),
+        "rss": ("velogb10_process_rss_bytes",),
+        "lanes": ("velogb10_max_batch",),
+        "kv_capacity": ("velogb10_kv_positions_capacity",),
+        "kv_used": ("velogb10_kv_positions_used",),
+        "kv_cached": ("velogb10_kv_positions_cached",),
+        "kv_peak": ("velogb10_kv_positions_peak",),
+        "kv_alloc": ("velogb10_kv_allocated_bytes",),
+        "lane_kv_capacity": ("velogb10_kv_lane_positions_capacity",),
+        "lane_kv_used": ("velogb10_kv_lane_positions_used",),
+        "lane_kv_cached": ("velogb10_kv_lane_positions_cached",),
+        "lane_kv_peak": ("velogb10_kv_lane_positions_peak",),
+    },
 }
 
 # Direct base-name renames (after stripping the tensorfold: prefix).
@@ -133,6 +153,25 @@ DIRECT = {
     "spec_decode_num_draft_tokens_total": "vllm_spec_decode_num_draft_tokens_total",
     "spec_decode_num_accepted_tokens_total": "vllm_spec_decode_num_accepted_tokens_total",
 }
+
+# veloGB10-only base names (matched after the velogb10_ strip, only when
+# STATE.schema == "velo-v1", so a foreign engine that later grows a same-named
+# family cannot be silently re-labelled). request_duration_seconds is the
+# engine's end-to-end histogram: its buckets map straight onto the vLLM e2e
+# family. prompt_tokens_cached_total is the prefix-cache hit counter.
+VELO_DIRECT = {
+    "prompt_tokens_cached_total": "vllm_prefix_cache_hits_total",
+    "request_duration_seconds": "vllm_e2e_request_latency_seconds",
+    "spec_draft_tokens_total": "vllm_spec_decode_num_draft_tokens_total",
+    "spec_accepted_tokens_total": "vllm_spec_decode_num_accepted_tokens_total",
+}
+
+# veloGB10 liveness/saturation gauges kept under tfexporter_ names: scheduler
+# stall detection and lane-reserve pressure, the two things an operator reads
+# first when a sweep starts crawling.
+VELO_TFEXPORTER_BASES = ("scheduler_busy", "scheduler_last_step_age_seconds",
+                         "scheduler_steps_total", "lane_reserve_waiting",
+                         "over_cap_arrivals_total")
 
 HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 
@@ -200,6 +239,8 @@ class State:
         # identity block (warming / lanes / version), both parsed per poll.
         self.extras = {}
         self.health_info = {}
+        # v1.5.0: veloGB10 version string from velogb10_build_info (one parse).
+        self.velo_build = ""
         # native profile: trailing window of finished counters, held rates
         self.window = []        # (ts, gen_fin, dec_s, prompt_fin, ttft_s)
         self.rate_decode = 0.0  # held true decode tps (delta gen / delta dec_s)
@@ -294,6 +335,18 @@ SCHEMA_SOURCES = {
         "pf": ("vllm:time_to_first_token_seconds_sum",),
         "run": ("vllm:num_requests_running",),
     },
+    # veloGB10 has no decode-seconds counter: "dur" (request_duration_seconds_sum,
+    # recorded at request completion) minus pf (time_to_first_token_seconds_sum,
+    # recorded at first token) is the honest decode-seconds numerator, applied
+    # in update_native_stats' velo branch.
+    "velo-v1": {
+        "gen": ("velogb10_generation_tokens_total",),
+        "dec": (),
+        "dur": ("velogb10_request_duration_seconds_sum",),
+        "prompt": ("velogb10_prompt_tokens_total",),
+        "pf": ("velogb10_time_to_first_token_seconds_sum",),
+        "run": ("velogb10_requests_running",),
+    },
 }
 
 
@@ -304,6 +357,8 @@ def detect_schema(text):
                engine/model_name labels) - e.g. the exlr8 GLM build
     zig-v1:    underscore families with labels (the flash17 Zig engine)
     python-v1: colon families (tensorfold:*) from the Python engine
+    velo-v1:   the veloGB10 EXL3 engine (`velogb10_prompt_tokens_total`,
+               TP=1 single-GB10 Qwen3.8/DeepSeek builds)
     unknown:   nothing recognised
     """
     if "vllm:prompt_tokens_total" in text or "vllm:generation_tokens_total" in text:
@@ -312,6 +367,8 @@ def detect_schema(text):
         return "zig-v1"
     if "tensorfold:generation_tokens_total" in text:
         return "python-v1"
+    if "velogb10_prompt_tokens_total" in text:
+        return "velo-v1"
     return "unknown"
 
 
@@ -369,12 +426,101 @@ def engine_native_series(existing_names):
     with STATE.lock:
         extras = dict(STATE.extras)
         info = dict(STATE.health_info)
+        schema = STATE.schema
+        velo_build = STATE.velo_build
     rows = []
 
     def add(name, value, kind, doc):
         if name in existing_names:
             return
         rows.append((name, value, kind, doc))
+
+    if schema == "velo-v1":
+        ts = getattr(STATE, "velo_tpot_sum", None)
+        tc = getattr(STATE, "velo_tpot_count", None)
+        if ts is not None and tc is not None:
+            add("vllm_request_time_per_output_token_seconds_sum", f"{ts:.3f}",
+                "counter",
+                "Total decode seconds over finished requests: "
+                "request_duration_seconds_sum minus time_to_first_token_seconds_sum "
+                "(veloGB10 exposes no decode-seconds counter). Feeds the dashboard "
+                "Decode Throughput Per-Req Avg as count/sum.")
+            add("vllm_request_time_per_output_token_seconds_count", str(int(tc)),
+                "counter",
+                "Completion tokens across all traffic (per-stream TPS denominator, "
+                "same convention as the zig profile).")
+        # ITL: same finished-request population as the TPOT pair above,
+        # aliased under vLLM's name (pinH convention: HELP states the alias).
+        if ts is not None and tc is not None:
+            add("vllm_inter_token_latency_seconds_sum", f"{ts:.3f}", "counter",
+                "Inter-token latency, same seconds/token population as the "
+                "synthesized TPOT pair (decode seconds over finished requests). "
+                "vLLM-named alias for the dashboard ITL tile.")
+            add("vllm_inter_token_latency_seconds_count", str(int(tc)),
+                "counter",
+                "Token intervals (completion tokens), vLLM-named alias of the "
+                "TPOT denominator.")
+            # Avg batch: tokens per scheduler decode step (gen/steps). With
+            # MTP this is the effective decode-batch width per step.
+            steps = getattr(STATE, "velo_steps", None)
+            if steps:
+                add("vllm_iteration_tokens_total_sum", str(int(tc)), "counter",
+                    "Tokens produced across scheduler decode steps "
+                    "(generation_tokens_total); pair with _count for avg batch.")
+                add("vllm_iteration_tokens_total_count", str(int(steps)),
+                    "counter",
+                    "Scheduler decode steps (velogb10_scheduler_steps_total); "
+                    "sum/count = tokens per step = effective decode batch.")
+        tpb = getattr(STATE, "velo_tps_buckets", None)
+        tot = getattr(STATE, "velo_tps_total", None)
+        if tpb and tot:
+            # ITL/TPOT SLO buckets: the engine publishes a PER-REQUEST
+            # decode-rate histogram (tokens/s); per-request TPOT/ITL is its
+            # exact reciprocal, so these buckets are a lossless change of
+            # variable of a measured distribution, not a modeled one.
+            # Requests sitting exactly on a bucket edge count as SLO misses
+            # (conservative; float measure-zero in practice).
+            for base, doc in (
+                ("vllm_request_time_per_output_token_seconds",
+                 "Per-request time per output token: derived as 1/tps from the "
+                 "engine's velogb10_decode_tokens_per_second_bucket histogram "
+                 "(exact reciprocal of a per-request measurement)."),
+                ("vllm_inter_token_latency_seconds",
+                 "Per-request inter-token latency: same reciprocal derivation "
+                 "as the TPOT histogram; same population as the ITL sum/count "
+                 "alias this exporter emits."),
+            ):
+                if base + "_bucket" in existing_names:
+                    continue
+                rows.append(("__meta__", base, "histogram", doc))
+                for le_s, cc in sorted((1.0 / le_t, tot - cum_t)
+                                       for le_t, cum_t in tpb if le_t > 0):
+                    rows.append(("__sample__", '%s_bucket{le="%g"} %d'
+                                 % (base, le_s, int(cc)), None, None))
+                rows.append(("__sample__", '%s_bucket{le="+Inf"} %d'
+                             % (base, int(tot)), None, None))
+        qi = getattr(STATE, "velo_q_int", None)
+        qb = getattr(STATE, "velo_q_base", None)
+        qd = getattr(STATE, "velo_q_done", None)
+        if qi is not None and qb is not None and qd is not None and qd > qb:
+            add("vllm_request_queue_time_seconds_sum", "%.1f" % qi, "counter",
+                "Queue wait seconds, Little's-law estimate: trapezoidal "
+                "time-integral of velogb10_requests_waiting sampled per "
+                "exporter poll since the exporter attached (veloGB10 has no "
+                "native queue-seconds counter).")
+            add("vllm_request_queue_time_seconds_count", str(int(qd - qb)),
+                "counter",
+                "Requests completed in the same window as the queue-time "
+                "integral (the Little's-law denominator).")
+        pq = getattr(STATE, "velo_prefix_queries", None)
+        if pq is not None:
+            # The dashboard's Cache block computes hit rate only when queries
+            # is present and >0; without this the tiles stay blank forever
+            # (v1.5.3). Queries = prompt tokens served, zig convention.
+            add("vllm_prefix_cache_queries_total", str(int(pq)), "counter",
+                "Prompt tokens served (prefix-cache denominator, same "
+                "convention as the zig profile: every prompt token is a "
+                "cache query).")
 
     rounds = extras.get("rounds")
     if rounds is not None:
@@ -428,9 +574,60 @@ def engine_native_series(existing_names):
             "Engine lanes = the hard cap on concurrent requests (/health max_batch_size). "
             "Compare with vllm_num_requests_running: pinned at this number means the "
             "engine is saturated, not slow.")
+    elif extras.get("lanes") is not None:
+        # veloGB10 /health carries no max_batch_size; the engine publishes its
+        # lane cap as velogb10_max_batch on /metrics instead (it is runtime-
+        # adjustable, so a static config value would lie).
+        add("tfexporter_engine_lanes", str(int(extras["lanes"])), "gauge",
+            "Engine lanes = the hard cap on concurrent requests (veloGB10 "
+            "velogb10_max_batch). Pinned at this number means saturated, not slow.")
+
+    # veloGB10 KV story: the pre-allocating lane pool, from the engine's own
+    # position counters. used/capacity is the honest pool utilization the vLLM
+    # gauge would show on a paged engine; peak/cached distinguish 'full of live
+    # context' from 'full of kept prompts' — the question a deep sweep raises.
+    kv = [("pool", "capacity", extras.get("kv_capacity")),
+          ("pool", "used", extras.get("kv_used")),
+          ("pool", "cached", extras.get("kv_cached")),
+          ("pool", "peak", extras.get("kv_peak")),
+          ("lane", "capacity", extras.get("lane_kv_capacity")),
+          ("lane", "used", extras.get("lane_kv_used")),
+          ("lane", "cached", extras.get("lane_kv_cached")),
+          ("lane", "peak", extras.get("lane_kv_peak"))]
+    got_kv = [(scope, state, v) for scope, state, v in kv if v is not None]
+    if got_kv and "tfexporter_kv_positions" not in existing_names:
+        rows.append(("__meta__", "tfexporter_kv_positions", "gauge",
+                     "KV pool positions (tokens): scope=pool is the whole engine "
+                     "pool, scope=lane the per-lane reserve; state=capacity/used/"
+                     "cached/peak. From velogb10_kv_*_positions_* counters."))
+        for scope, state, v in got_kv:
+            rows.append(("__sample__",
+                         ('tfexporter_kv_positions{scope="%s",state="%s"} %d'
+                          % (scope, state, int(v))), None, None))
+        alloc = extras.get("kv_alloc")
+        if alloc is not None:
+            add("tfexporter_kv_allocated_bytes", str(int(alloc)), "gauge",
+                "Bytes the engine has allocated for its KV pools "
+                "(velogb10_kv_allocated_bytes).")
+        cap = extras.get("kv_capacity")
+        used = extras.get("kv_used")
+        if cap and used is not None:
+            # vLLM v1 semantics: this gauge is a 0..1 RATIO; the dashboard
+            # multiplies by 100 itself. Emitting a percent here showed 391%
+            # on the tile (fixed in v1.5.1).
+            ratio = used / cap
+            add("vllm_kv_cache_usage_perc", f"{ratio:.4f}", "gauge",
+                "KV pool utilization ratio (0..1, vLLM v1 semantics): velogb10 positions used/capacity. "
+                "used counts live context positions only; retained cached prompt "
+                "blocks are separate (see tfexporter_kv_positions{state=\"cached\"}).")
+
     version = _label_safe(info.get("version", ""))
     backend = _label_safe(info.get("backend", ""))
-    model = _label_safe(info.get("model", "") or MODELS_CACHE.get("model_id", ""))
+    if schema == "velo-v1":
+        # veloGB10 /health is {status, telemetry} only — no version/backend fields.
+        version = version or _label_safe(velo_build)
+        backend = backend or "velogb10"
+    model = _label_safe(info.get("model", "") or MODELS_CACHE.get("model_id") or "")
     if (version or backend) and "tfexporter_engine_info" not in existing_names:
         # One sample only, the labelled one: a bare tfexporter_engine_info 1 next to the
         # labelled form made the series read as two different engines (caught live, not
@@ -562,6 +759,11 @@ def update_native_stats(text, now):
     gen = vals.get("gen")
     if gen is None:
         return
+    if STATE.schema == "velo-v1":
+        # No decode-seconds counter exists on this engine: total completed-request
+        # time minus TTFT time is the honest decode numerator (both are recorded
+        # per finished request, so the difference shares the same denominator).
+        vals["dec"] = max(0.0, (vals.get("dur") or 0.0) - (vals.get("pf") or 0.0))
     dec = vals.get("dec") or 0.0
     prompt = vals.get("prompt") or 0.0
     pf = vals.get("pf") or 0.0
@@ -598,6 +800,114 @@ def update_native_stats(text, now):
             if cached_v is not None:
                 STATE.last_cached = cached_v
             STATE.last_inflight = running
+    elif STATE.schema == "velo-v1":
+        # veloGB10: its own prefix-cache hit counter, admission refusals, and an
+        # uptime regression that means the engine was restarted (same wipe
+        # discipline as zig: rates, offsets and probe history are era-bound).
+        # mem_available_bytes is the engine's reading of the serving host - use it
+        # instead of the exporter-local /proc/meminfo, which is the wrong machine
+        # whenever the exporter runs remotely (e.g. .21 watching .25).
+        cached_v = rejected_v = up = None
+        mem_v = None
+        steps_v = None
+        build = None
+        tps_b = []
+        wait_v = None
+        done_v = None
+        done_bare = None
+        for line in text.splitlines():
+            if line.startswith("velogb10_prompt_tokens_cached_total"):
+                cached_v = _fnum(line)
+            elif line.startswith("velogb10_requests_rejected_total"):
+                rejected_v = _fnum(line)
+            elif line.startswith("velogb10_uptime_seconds"):
+                up = _fnum(line)
+            elif line.startswith("velogb10_mem_available_bytes"):
+                mem_v = _fnum(line)
+            elif line.startswith("velogb10_build_info"):
+                build = line
+            elif line.startswith("velogb10_scheduler_steps_total"):
+                steps_v = _fnum(line)
+            elif line.startswith("velogb10_decode_tokens_per_second_bucket"):
+                k1 = line.find('le="')
+                if k1 >= 0:
+                    k2 = line.find('"', k1 + 4)
+                    try:
+                        tps_b.append((float(line[k1 + 4:k2]),
+                                      float(line.rsplit(" ", 1)[1])))
+                    except ValueError:
+                        pass
+            elif line.startswith("velogb10_requests_waiting"):
+                wait_v = _fnum(line)
+            elif line.startswith("velogb10_requests_total{"):
+                v_fin = _fnum(line)
+                if v_fin is not None:
+                    done_v = (done_v or 0.0) + v_fin
+            elif line.startswith("velogb10_requests_total "):
+                done_bare = _fnum(line)
+        with STATE.lock:
+            if cached_v is not None:
+                STATE.last_cached = cached_v
+            if rejected_v is not None:
+                STATE.last_rejected = rejected_v
+            # Cumulative TPOT-shape pair for the dashboard's Decode Throughput
+            # "Per-Req Avg": same house convention as the zig emitter
+            # (sum = finished decode seconds, count = completion tokens).
+            STATE.velo_tpot_sum = dec
+            STATE.velo_tpot_count = gen
+            STATE.velo_prefix_queries = prompt
+            if mem_v is not None:
+                STATE.mem_gib = mem_v / (1024.0 ** 3)
+            if steps_v is not None:
+                STATE.velo_steps = steps_v
+            if tps_b:
+                inf_cum = None
+                finite = []
+                for le_t, cum_t in tps_b:
+                    if le_t == float("inf"):
+                        inf_cum = cum_t
+                    else:
+                        finite.append((le_t, cum_t))
+                STATE.velo_tps_buckets = sorted(finite)
+                STATE.velo_tps_total = inf_cum if inf_cum is not None else 0
+            # Queue time: veloGB10 publishes no queue-seconds counter, so the
+            # exporter measures it with Little's law on its own polling
+            # timeline: mean queue wait = (time-integral of the waiting gauge)
+            # / completions over the SAME window (L = lambda * W). Trapezoidal
+            # integration of the gauge sampled once per poll; the window opens
+            # when the exporter first sees the engine, and rebases on any
+            # counter reset (engine restart). Both emitted series share that
+            # window, so sum/count is a coherent average.
+            if done_v is None and done_bare is not None:
+                done_v = done_bare   # bare form (some builds): no finish labels
+            if wait_v is not None and done_v is not None:
+                if getattr(STATE, "velo_q_t", None) is None or done_v < STATE.velo_q_base:
+                    STATE.velo_q_int = 0.0
+                    STATE.velo_q_t = now
+                    STATE.velo_q_w = wait_v
+                    STATE.velo_q_base = done_v
+                else:
+                    dt_q = now - STATE.velo_q_t
+                    if 0 < dt_q < 300:
+                        STATE.velo_q_int += (STATE.velo_q_w + wait_v) * 0.5 * dt_q
+                    STATE.velo_q_t = now
+                    STATE.velo_q_w = wait_v
+                STATE.velo_q_done = done_v
+            if build is not None and STATE.velo_build == "":
+                i = build.find('version="')
+                if i >= 0:
+                    j = build.find('"', i + 9)
+                    if j > i:
+                        STATE.velo_build = build[i + 9:j]
+            if up is not None:
+                if STATE.prev_uptime is not None and up < STATE.prev_uptime:
+                    STATE.restarts += 1
+                    STATE.offsets = {}
+                    STATE.probe_hist = {}
+                    STATE.probe = {"ttft": [0.0, 0], "e2e": [0.0, 0], "itl": [0.0, 0]}
+                    STATE.rate_prefill_hold = None  # new era: no rate history
+                STATE.prev_uptime = up
+            STATE.last_inflight = running
     with STATE.lock:
         if STATE.window:
             _, p_gen, p_dec, p_prompt, p_pf, p_cached = STATE.window[-1]
@@ -607,7 +917,7 @@ def update_native_stats(text, now):
                 STATE.rate_decode = 0.0
                 STATE.rate_prefill = 0.0
         cached_wv = (STATE.last_cached
-                     if STATE.schema in ("zig-v1", "vllm-v1") else None)
+                     if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1") else None)
         STATE.window.append((now, gen, dec, prompt, pf, cached_wv))
         cutoff = now - RATE_WINDOW_S
         while STATE.window and STATE.window[0][0] < cutoff:
@@ -634,7 +944,7 @@ def update_native_stats(text, now):
                     STATE.rate_prefill = max(0.0, d_prompt - d_cached) / d_pf
                     if STATE.rate_prefill > 0:
                         STATE.rate_prefill_hold = STATE.rate_prefill
-    if STATE.schema in ("zig-v1", "vllm-v1"):
+    if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1"):
         with STATE.lock:
             cached_now = STATE.last_cached
             if (cached_now is not None and STATE.prev_cached is not None
@@ -911,6 +1221,8 @@ def rewrite(text):
     if detect_schema(text) == "vllm-v1":
         # Native vLLM engine: nothing to translate, only the namespace rename.
         return vllm_rewrite(text)
+    with STATE.lock:
+        schema = STATE.schema
     families = {}  # mapped family key -> [sample lines] (keys may carry _bucket/_sum/_count)
     meta = {}      # mapped BARE family name -> {"help": str|None, "type": str|None}
     kv_stream_max = None
@@ -954,6 +1266,8 @@ def rewrite(text):
                 # Store metadata under the BARE mapped name; at output time it
                 # is re-attached to every _bucket/_sum/_count sample family.
                 set_meta(DIRECT[base], kind, doc)
+            elif schema == "velo-v1" and base in VELO_DIRECT:
+                set_meta(VELO_DIRECT[base], kind, doc)
             continue
 
         m = SAMPLE_RE.match(line)
@@ -1024,9 +1338,14 @@ def rewrite(text):
         if base == "streams":
             put_sample("tfexporter_streams", labels, value)
             continue
+        if schema == "velo-v1" and base in VELO_TFEXPORTER_BASES:
+            put_sample(f"tfexporter_{base}", labels, value)
+            continue
 
         if base in DIRECT:
             put_sample(DIRECT[base] + suffix, labels, value)
+        elif schema == "velo-v1" and base in VELO_DIRECT:
+            put_sample(VELO_DIRECT[base] + suffix, labels, value)
 
     prompt_total = None
     pt_samples = families.get("vllm_prompt_tokens_total")
@@ -1322,11 +1641,15 @@ def poll_loop():
             except (urllib.error.URLError, OSError, ValueError):
                 pass
             try:
-                with open("/proc/meminfo") as f:
-                    for ln in f:
-                        if ln.startswith("MemAvailable:"):
-                            STATE.mem_gib = float(ln.split()[1]) / (1024.0 * 1024.0)
-                            break
+                # velo-v1 skips the exporter-local reading: update_native_stats
+                # already set mem_gib from velogb10_mem_available_bytes, which is
+                # the SERVING host's value (the exporter itself may run elsewhere).
+                if schema != "velo-v1":
+                    with open("/proc/meminfo") as f:
+                        for ln in f:
+                            if ln.startswith("MemAvailable:"):
+                                STATE.mem_gib = float(ln.split()[1]) / (1024.0 * 1024.0)
+                                break
             except OSError:
                 pass
             else:

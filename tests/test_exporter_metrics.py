@@ -10,7 +10,8 @@ import os
 import threading
 import unittest
 
-EXPORTER_PATH = "/home/admin/llm/tensorfold-metrics-exporter/exporter.py"
+EXPORTER_PATH = os.environ.get("TF_EXPORTER_PATH",
+                               "/home/admin/llm/tensorfold-metrics-exporter/exporter.py")
 
 ZIG_TEXT = (
     '# HELP tensorfold_requests_total Requests.\n'
@@ -1193,6 +1194,233 @@ class EngineNativeSeriesTests(unittest.TestCase):
                     self.assertIn(base, seen_types, "sample before its TYPE for " + base)
 
 
+
+
+VELO_TEXT = (
+    '# HELP velogb10_prompt_tokens_total Prompt tokens.\n'
+    '# TYPE velogb10_prompt_tokens_total counter\n'
+    'velogb10_prompt_tokens_total 1000\n'
+    '# TYPE velogb10_prompt_tokens_cached_total counter\n'
+    'velogb10_prompt_tokens_cached_total 400\n'
+    '# TYPE velogb10_generation_tokens_total counter\n'
+    'velogb10_generation_tokens_total 200\n'
+    '# TYPE velogb10_requests_running gauge\n'
+    'velogb10_requests_running 2\n'
+    '# TYPE velogb10_requests_waiting gauge\n'
+    'velogb10_requests_waiting 1\n'
+    '# TYPE velogb10_requests_total counter\n'
+    'velogb10_requests_total 10\n'
+    '# TYPE velogb10_requests_rejected_total counter\n'
+    'velogb10_requests_rejected_total 0\n'
+    '# TYPE velogb10_uptime_seconds gauge\n'
+    'velogb10_uptime_seconds 5000\n'
+    '# TYPE velogb10_mem_available_bytes gauge\n'
+    'velogb10_mem_available_bytes 42949672960\n'
+    '# TYPE velogb10_build_info gauge\n'
+    'velogb10_build_info{version="0.7.8",commit="abc",dirty="1"} 1\n'
+    '# TYPE velogb10_max_batch gauge\n'
+    'velogb10_max_batch 4\n'
+    '# TYPE velogb10_spec_rounds_total counter\n'
+    'velogb10_spec_rounds_total 100\n'
+    '# TYPE velogb10_spec_draft_tokens_total counter\n'
+    'velogb10_spec_draft_tokens_total 500\n'
+    '# TYPE velogb10_spec_accepted_tokens_total counter\n'
+    'velogb10_spec_accepted_tokens_total 300\n'
+    '# TYPE velogb10_kv_positions_capacity gauge\n'
+    'velogb10_kv_positions_capacity 262144\n'
+    '# TYPE velogb10_kv_positions_used gauge\n'
+    'velogb10_kv_positions_used 65536\n'
+    '# TYPE velogb10_kv_positions_cached gauge\n'
+    'velogb10_kv_positions_cached 8192\n'
+    '# TYPE velogb10_kv_positions_peak gauge\n'
+    'velogb10_kv_positions_peak 131072\n'
+    '# TYPE velogb10_kv_allocated_bytes gauge\n'
+    'velogb10_kv_allocated_bytes 5636096000\n'
+    '# TYPE velogb10_kv_lane_positions_capacity gauge\n'
+    'velogb10_kv_lane_positions_capacity 262144\n'
+    '# TYPE velogb10_kv_lane_positions_used gauge\n'
+    'velogb10_kv_lane_positions_used 32768\n'
+    '# TYPE velogb10_kv_lane_positions_cached gauge\n'
+    'velogb10_kv_lane_positions_cached 4096\n'
+    '# TYPE velogb10_kv_lane_positions_peak gauge\n'
+    'velogb10_kv_lane_positions_peak 65536\n'
+    '# TYPE velogb10_time_to_first_token_seconds histogram\n'
+    'velogb10_time_to_first_token_seconds_sum 4\n'
+    'velogb10_time_to_first_token_seconds_count 8\n'
+    '# TYPE velogb10_request_duration_seconds histogram\n'
+    'velogb10_request_duration_seconds_sum 24\n'
+    'velogb10_request_duration_seconds_count 8\n'
+    'velogb10_request_duration_seconds_bucket{le="30"} 8\n'
+    '# TYPE velogb10_scheduler_busy gauge\n'
+    'velogb10_scheduler_busy 1\n'
+    '# TYPE velogb10_scheduler_steps_total counter\n'
+    'velogb10_scheduler_steps_total 4020\n'
+    '# TYPE velogb10_decode_tokens_per_second histogram\n'
+    'velogb10_decode_tokens_per_second_bucket{le="5"} 2\n'
+    'velogb10_decode_tokens_per_second_bucket{le="10"} 4\n'
+    'velogb10_decode_tokens_per_second_bucket{le="20"} 9\n'
+    'velogb10_decode_tokens_per_second_bucket{le="50"} 10\n'
+    'velogb10_decode_tokens_per_second_bucket{le="+Inf"} 10\n'
+    'velogb10_decode_tokens_per_second_sum 180.5\n'
+    'velogb10_decode_tokens_per_second_count 10\n'
+    'velogb10_requests_total{finish="stop"} 4\n'
+    'velogb10_requests_total{finish="length"} 4\n'
+    'velogb10_requests_total{finish="tool_calls"} 2\n'
+    'velogb10_requests_total{finish="error"} 0\n'
+    'velogb10_requests_total{finish="cancelled"} 0\n'
+)
+
+# Second poll: +100 gen, +500 prompt, TTFT +1 s, e2e +5 s -> decode +4 s.
+VELO_STEP = VELO_TEXT.replace(
+    "velogb10_generation_tokens_total 200",
+    "velogb10_generation_tokens_total 300").replace(
+    "velogb10_prompt_tokens_total 1000",
+    "velogb10_prompt_tokens_total 1500").replace(
+    "velogb10_time_to_first_token_seconds_sum 4",
+    "velogb10_time_to_first_token_seconds_sum 5").replace(
+    "velogb10_request_duration_seconds_sum 24",
+    "velogb10_request_duration_seconds_sum 29")
+
+
+class VeloGB10Tests(unittest.TestCase):
+    """velo-v1 schema: detection, dur-minus-ttft decode rate, the DIRECT maps,
+    and the KV/lanes/engine_info series the vLLM adapter has no name for."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_exporter()
+
+    def setUp(self):
+        st = self.m.STATE
+        st.schema = "velo-v1"
+        st.window = []
+        st.rate_decode = 0.0
+        st.rate_prefill = 0.0
+        st.rate_prefill_hold = None
+        st.cache_ratio = None
+        st.prev_cached = None
+        st.prev_prompt_r = None
+        st.restarts = 0
+        st.prev_uptime = None
+        st.probe_hist = {}
+        st.offsets = {}
+        st.last_cached = None
+        st.last_stalled = 0
+        st.last_fatal = 0
+        st.last_inflight = 0
+        st.last_rejected = None
+        st.extras = {}
+        st.health_info = {}
+        for attr in ("velo_q_t", "velo_q_int", "velo_q_base", "velo_q_done",
+                     "velo_tps_buckets", "velo_tps_total"):
+            setattr(st, attr, None)
+        st.velo_build = ""
+        st.live_engine = None
+        st.live_engine_ts = 0.0
+
+    def test_detect_schema_velo(self):
+        self.assertEqual(self.m.detect_schema(VELO_TEXT), "velo-v1")
+
+    def test_velo_rates_decode_from_e2e_minus_ttft(self):
+        m, st = self.m, self.m.STATE
+        m.update_native_stats(VELO_TEXT, 1000.0)
+        m.update_native_stats(VELO_STEP, 1010.0)
+        # decode seconds over the window: (29-5) - (24-4) = 4; gen delta 100
+        self.assertAlmostEqual(st.rate_decode, 25.0, places=3)
+        # prefill: (1500-1000 prompt - 0 cached) / (5-4) ttft = 500
+        self.assertAlmostEqual(st.rate_prefill, 500.0, places=3)
+
+    def test_velo_cached_rejected_mem_build_restart(self):
+        m, st = self.m, self.m.STATE
+        st.mem_gib = -1.0  # the exporter-host reading must be overridden
+        m.update_native_stats(VELO_TEXT, 1000.0)
+        self.assertEqual(st.last_cached, 400.0)
+        self.assertEqual(st.last_rejected, 0.0)
+        self.assertEqual(st.last_inflight, 2)
+        self.assertAlmostEqual(st.mem_gib, 40.0, places=6)
+        self.assertEqual(st.velo_build, "0.7.8")
+        m.update_native_stats(VELO_TEXT.replace(
+            "velogb10_uptime_seconds 5000", "velogb10_uptime_seconds 10"),
+            1010.0)
+        self.assertEqual(st.restarts, 1)
+
+    def test_velo_rewrite_maps_vllm_families(self):
+        body = self.m.rewrite(VELO_TEXT).decode()
+        for needle in (
+                "vllm_prompt_tokens_total 1000",
+                "vllm_generation_tokens_total 200",
+                "vllm_num_requests_running 2",
+                "vllm_num_requests_waiting 1",
+                "vllm_time_to_first_token_seconds_sum 4",
+                'vllm_e2e_request_latency_seconds_bucket{le="30"} 8',
+                "vllm_prefix_cache_hits_total 400",
+                "vllm_spec_decode_num_draft_tokens_total 500",
+                "vllm_spec_decode_num_accepted_tokens_total 300",
+                "tfexporter_scheduler_busy 1",
+                "tfexporter_requests_total 10",
+                "tfexporter_mtp_acceptance_ratio 0.6000"):
+            self.assertIn(needle, body)
+
+    def test_velo_native_series_kv_lanes_identity(self):
+        m, st = self.m, self.m.STATE
+        m.update_engine_extras(VELO_TEXT)
+        m.update_native_stats(VELO_TEXT, 1000.0)  # fills velo_build
+        rows = m.engine_native_series(set())
+        samples = [r[1] for r in rows if r[0] == "__sample__"]
+        self.assertIn('tfexporter_kv_positions{scope="pool",state="capacity"} '
+                      '262144', samples)
+        self.assertIn('tfexporter_kv_positions{scope="lane",state="used"} 32768',
+                      samples)
+        self.assertIn('tfexporter_kv_positions{scope="lane",state="peak"} 65536',
+                      samples)
+        plain = ["%s %s" % (r[0], r[1]) for r in rows
+                 if r[0] not in ("__meta__", "__sample__")]
+        self.assertIn("vllm_kv_cache_usage_perc 0.2500", plain)
+        self.assertIn("vllm_request_time_per_output_token_seconds_sum 20.000", plain)
+        self.assertIn("vllm_request_time_per_output_token_seconds_count 200", plain)
+        self.assertIn("vllm_prefix_cache_queries_total 1000", plain)
+        self.assertIn("vllm_inter_token_latency_seconds_sum 20.000", plain)
+        self.assertIn("vllm_inter_token_latency_seconds_count 200", plain)
+        self.assertIn("vllm_iteration_tokens_total_sum 200", plain)
+        self.assertIn("vllm_iteration_tokens_total_count 4020", plain)
+        self.assertIn(("__meta__", "vllm_inter_token_latency_seconds",
+                       "histogram"), None if False else tuple(
+                           (r[0], r[1], r[2]) for r in rows
+                           if r[0] == "__meta__"))
+        self.assertIn('vllm_inter_token_latency_seconds_bucket{le="0.05"} 1',
+                      samples)
+        self.assertIn('vllm_inter_token_latency_seconds_bucket{le="+Inf"} 10',
+                      samples)
+        self.assertIn('vllm_request_time_per_output_token_seconds_bucket{le="0.05"} 1',
+                      samples)
+        self.assertIn('vllm_request_time_per_output_token_seconds_bucket{le="0.2"} 8',
+                      samples)
+        self.assertIn("tfexporter_engine_lanes 4", plain)
+        self.assertIn("tfexporter_kv_allocated_bytes 5636096000", plain)
+        info = [s for s in samples if s.startswith("tfexporter_engine_info{")]
+        self.assertEqual(len(info), 1)
+        self.assertIn('backend="velogb10"', info[0])
+        self.assertIn('version="0.7.8"', info[0])
+
+    def test_velo_queue_littles_law_pair(self):
+        m, st = self.m, self.m.STATE
+        m.update_native_stats(VELO_TEXT, 1000.0)   # window opens, nothing yet
+        rows = m.engine_native_series(set())
+        names = [r[0] for r in rows]
+        self.assertNotIn("vllm_request_queue_time_seconds_sum", names)
+        text2 = (VELO_TEXT
+                 .replace("velogb10_requests_waiting 1",
+                          "velogb10_requests_waiting 3")
+                 .replace('velogb10_requests_total{finish="stop"} 4',
+                          'velogb10_requests_total{finish="stop"} 6'))
+        m.update_native_stats(text2, 1010.0)
+        rows = m.engine_native_series(set())
+        plain = dict((r[0], r[1]) for r in rows
+                     if r[0] not in ("__meta__", "__sample__"))
+        # trapezoid (1+3)/2 * 10s = 20 queue-seconds over 2 completions
+        self.assertAlmostEqual(float(plain["vllm_request_queue_time_seconds_sum"]),
+                               20.0, places=1)
+        self.assertEqual(plain["vllm_request_queue_time_seconds_count"], "2")
 
 
 if __name__ == "__main__":

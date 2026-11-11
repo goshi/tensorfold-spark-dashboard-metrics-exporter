@@ -1,7 +1,86 @@
 # Changelog
 
+## 1.5.5 - 2026-11-11
+- velo-v1: SLO Goodput buckets for ITL/TPOT tiles. The engine publishes a
+  per-request decode-rate histogram (velogb10_decode_tokens_per_second_bucket);
+  per-request TPOT/ITL is its exact reciprocal, so the adapter now emits
+  vllm_inter_token_latency_seconds_bucket and
+  vllm_request_time_per_output_token_seconds_bucket as a lossless change of
+  variable (cumulative, ascending, +Inf = total). Edge requests on a bucket
+  boundary count as SLO misses (conservative). Also unlocks p50/p95/p99
+  percentiles for both tiles.
+- velo-v1: Latency->Queue tile. veloGB10 has no queue-seconds counter; the
+  adapter measures queue time with Little's law on its own 2s polling
+  timeline: trapezoidal time-integral of velogb10_requests_waiting over
+  completions in the same window (vllm_request_queue_time_seconds_sum/_count,
+  both baselined at exporter attach; rebased on engine counter reset).
+  Denominator falls back to the bare requests_total when no finish-labelled
+  samples exist.
+- Tests: +1 (Little's-law pair), bucket asserts on the identity test. 95 OK.
+
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## 1.5.4 - 2026-11-11
+- velo-v1: Latency tile fill-ins. ITL emitted as the vLLM-named alias of the
+  TPOT pair (`vllm_inter_token_latency_seconds_sum/_count` — same finished-
+  request decode-seconds population); effective decode batch emitted as
+  `vllm_iteration_tokens_total_sum/_count` = generation_tokens_total over
+  velogb10_scheduler_steps_total (tokens per scheduler step — with MTP this
+  is the real per-step batch width).
+
+## 1.5.3 - 2026-11-11
+- velo-v1: Cache block. `vllm_prefix_cache_queries_total` = prompt tokens
+  served (zig convention: every prompt token is a cache query). Without it
+  the dashboard never computes a hit rate and the tile stays blank even when
+  `vllm_prefix_cache_hits_total` is non-zero.
+
+## 1.5.2 - 2026-11-11
+- velo-v1: Decode Throughput "Per-Req Avg". Synthesized TPOT pair:
+  `vllm_request_time_per_output_token_seconds_sum` = finished-request decode
+  seconds (request_duration_seconds_sum minus time_to_first_token_seconds_sum
+  — the engine exposes no decode-seconds counter), `_count` = completion
+  tokens. Live cross-check against client-measured decode rate: 0.4%.
+
+## 1.5.1 - 2026-11-11
+- velo-v1: KV gauge convention fix. `vllm_kv_cache_usage_perc` must be a
+  RATIO in 0..1 (the dashboard multiplies by 100 itself); v1.5.0 emitted
+  100*used/cap, so the tile showed 391.0% where the pool was 3.9% full.
+  Test pins 0.2500 at used/cap = 1/4.
+
+## [1.5.0] - 2026-11-11
+
+### Added
+- **veloGB10 is a first-class engine (`velo-v1` schema).** The single-GB10 EXL3
+  runtime (`sf-stav/veloGB10`) publishes rich `velogb10_*` families but no vLLM
+  namespace, so the dashboard saw nothing. The exporter now detects it, renames the
+  canonical five into the vLLM contract (`prompt/generation_tokens_total`,
+  `num_requests_running/waiting`, `time_to_first_token_seconds_*` incl. buckets) and
+  maps the engine-only families: `prompt_tokens_cached_total` →
+  `vllm_prefix_cache_hits_total`, `request_duration_seconds` histogram →
+  `vllm_e2e_request_latency_seconds`, `spec_draft/accepted_tokens_total` →
+  the spec-decode pair (feeding `tfexporter_mtp_acceptance_ratio` synthesis),
+  `scheduler_busy/last_step_age/steps_total` + `lane_reserve_waiting` +
+  `over_cap_arrivals_total` → `tfexporter_*` liveness gauges, `max_batch` →
+  `tfexporter_engine_lanes`, `kv_*_positions_*` → labelled `tfexporter_kv_positions`
+  with a `vllm_kv_cache_usage_perc` used/capacity gauge, and
+  `velogb10_build_info` → the `tfexporter_engine_info` identity labels
+  (`backend="velogb10"`).
+- **Honest decode rate without a decode-seconds counter.** veloGB10 has none:
+  the derived window uses `request_duration_seconds_sum - time_to_first_token_seconds_sum`
+  as the decode numerator - both recorded per finished request, so the ratio keeps
+  the same denominator as the generation counter.
+- **Serving-host memory over exporter-host memory.** When the exporter watches a
+  remote node, `tfexporter_mem_available_gib` previously read the exporter's own
+  `/proc/meminfo`; for `velo-v1` it now reports `velogb10_mem_available_bytes`.
+
+### Fixed
+- `tfexporter_engine_info` rendered `model="None"` when `/v1/models` had not been
+  cached yet (the MODELS_CACHE default is None, not "").
+
+### Notes
+- Family names verified against a live veloGB10 v0.7.8 exposition (95 families);
+  unit suite covers detection, rates, maps and native series (93 tests).
 
 ## [1.4.0] - 2026-11-03
 
