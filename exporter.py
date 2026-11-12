@@ -92,7 +92,7 @@ PREFIXES = ("tensorfold_health:", "tensorfold:", "velogb10_")
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 
 # How long an engine /health "live" reading stays believable. The engine keeps its own
 # 2 s sliding window (core/lane_host.zig: tokens over window_ns, divided by 2.0), so a
@@ -314,6 +314,13 @@ def update_models_cache():
 
 
 SCHEMA_SOURCES = {
+    "tandem-v1": {
+        "gen": ("qse_generation_tokens_total",),
+        "dec": ("qse_time_per_output_token_seconds_sum",),
+        "prompt": ("qse_prefill_tokens_forwarded_total",),
+        "pf": ("qse_request_prefill_seconds_sum",),
+        "run": ("qse_requests_running",),
+    },
     "zig-v1": {
         "gen": ("tensorfold_completion_tokens_total",),
         "dec": ("tensorfold_decode_seconds_total",),
@@ -376,6 +383,11 @@ def detect_schema(text):
                TP=1/2 NVFP4 builds); all vllm_* families come from the
                engine_native_series flare branch because Flare's family names
                share no suffix with the vLLM namespace
+    tandem-v1: TandemLLM (qwen38-spark-engine, `qse_requests_running`); the
+               engine publishes a real Prometheus /metrics in the `qse_*`
+               namespace with genuine TTFT/E2E/TPOT/queue histograms, so the
+               dashboard set is a near-1:1 rename; raw qse_* families pass
+               through untouched (zero name collisions, verified 2026-11-12)
     unknown:   nothing recognised
     """
     if "vllm:prompt_tokens_total" in text or "vllm:generation_tokens_total" in text:
@@ -388,6 +400,8 @@ def detect_schema(text):
         return "velo-v1"
     if "flare_prefill_tokens_total" in text:
         return "flare-v1"
+    if "qse_requests_running" in text:
+        return "tandem-v1"
     return "unknown"
 
 
@@ -453,6 +467,159 @@ def engine_native_series(existing_names):
         if name in existing_names:
             return
         rows.append((name, value, kind, doc))
+
+    if STATE.schema == "tandem-v1":
+        t = STATE.tandem or {}
+
+        def tv(name):
+            return t.get(name)
+
+        def pair(dst, srcname, help_text):
+            s = tv(srcname + "_sum")
+            c = tv(srcname + "_count")
+            if s is None or c is None:
+                return
+            add(dst + "_sum", f'{persisted_value("tandem_" + dst + "_sum", s):.6f}',
+                "counter", help_text)
+            add(dst + "_count", str(int(persisted_value("tandem_" + dst + "_count", c))),
+                "counter", help_text)
+
+        run = tv("qse_requests_running")
+        if run is not None:
+            add("vllm_num_requests_running", str(int(run)), "gauge",
+                "Requests generating (qse_requests_running).")
+        wait = tv("qse_requests_waiting")
+        if wait is not None:
+            add("vllm_num_requests_waiting", str(int(wait)), "gauge",
+                "Queued requests (qse_requests_waiting).")
+        fresh = getattr(STATE, "tandem_fresh", None)
+        if fresh is not None:
+            add("vllm_prompt_tokens_total",
+                str(int(persisted_value("tandem_prompt_tokens_total", fresh))),
+                "counter",
+                "FRESH prefill tokens, defined as qse_prompt_tokens_total - "
+                "qse_prompt_tokens_cached_total. NOT "
+                "qse_prefill_tokens_forwarded_total: that counter carries "
+                "4096-grid chunk padding and breaks the adapter identity. "
+                "The dashboard derives the Prefill tiles from this counter as "
+                "COMPUTE throughput (skill rule). SERVED lives in "
+                "vllm_prefix_cache_queries_total.")
+        served = tv("qse_prompt_tokens_total")
+        if served is not None:
+            add("vllm_prefix_cache_queries_total",
+                str(int(persisted_value("tandem_prefix_cache_queries_total", served))),
+                "counter",
+                "Served prompt tokens (qse_prompt_tokens_total, fresh + "
+                "cached): the hit-rate denominator. Identity: queries - "
+                "prompt_tokens = hits holds on the engine's own counters.")
+        hits = getattr(STATE, "tandem_hits", None)
+        if hits is not None:
+            add("vllm_prefix_cache_hits_total",
+                str(int(persisted_value("tandem_prefix_cache_hits_total", hits))),
+                "counter",
+                "Prefix-cache hits in tokens: qse_prompt_tokens_cached_total "
+                "clamped to served, falling back to qse_cache_hits_- "
+                "total{kind=prefix}; paired with prompt=queries-hits so the "
+                "identity is exact.")
+        gen_fin = tv("qse_generation_tokens_total")
+        live = getattr(STATE, "tandem_live_gen", 0.0)
+        if gen_fin is not None or live:
+            g = max(gen_fin or 0.0, live)
+            add("vllm_generation_tokens_total",
+                str(int(persisted_value("tandem_generation_tokens_total", g))),
+                "counter",
+                "Hybrid LIVE generation counter: max(qse_generation_tokens_- "
+                "total [incremented per finished request in on_request()], "
+                "exporter-summed kv_length growth of decoding-phase slots). "
+                "The engine has no live token counter; this keeps the Live "
+                "decode tile non-zero mid-generation, the same class of fix "
+                "as the tensorfold health-completion source.")
+        succ = tv("qse_request_success_total")
+        if succ is not None:
+            add("vllm_request_success_total",
+                str(int(persisted_value("tandem_request_success_total", succ))),
+                "counter", "Finished requests (qse_request_success_total).")
+        add("vllm_num_requests_swapped", "0", "counter",
+            "Documented zero: TandemLLM has no batching scheduler - server/"
+            "metrics.py states 'no preemption to report; those metrics belong "
+            "to a batching scheduler and this server has none'.")
+        add("vllm_num_preemptions_total", "0", "counter",
+            "Documented zero: 8 independent lanes, no preemption path exists "
+            "(server/metrics.py, same statement as swapped).")
+        kr = getattr(STATE, "tandem_kv_ratio", None)
+        if kr is not None:
+            add("vllm_kv_cache_usage_perc", f"{kr:.4f}", "gauge",
+                "KV usage 0..1 (house semantics): sum of slots[].kv_length "
+                "over busy slots / (QSE_PARALLEL x max_len), from /health "
+                "parallel.slots; 0 when every lane is idle.")
+            add("vllm_gpu_cache_usage_perc", f"{kr:.4f}", "gauge",
+                "Twin of kv_cache_usage_perc (adapter fallback chain).")
+        pair("vllm_time_to_first_token_seconds", "qse_time_to_first_token_seconds",
+             "Native engine histogram renamed from qse_time_to_first_token_- "
+             "seconds (per-request TTFT at /v1; probe disabled).")
+        pair("vllm_e2e_request_latency_seconds", "qse_e2e_request_latency_seconds",
+             "Native per-request end-to-end seconds (qse_e2e_request_latency_- "
+             "seconds), renamed.")
+        pair("vllm_request_time_per_output_token_seconds", "qse_time_per_output_token_seconds",
+             "Native per-request TPOT seconds (qse_time_per_output_token_- "
+             "seconds), renamed.")
+        pair("vllm_time_per_output_token_seconds", "qse_time_per_output_token_seconds",
+             "Alias of the TPOT pair under the tile name without the request_ "
+             "prefix; the engine has one measured TPOT population, not two.")
+        pair("vllm_inter_token_latency_seconds", "qse_time_per_output_token_seconds",
+             "Alias of TPOT: the engine publishes no separate inter-token "
+             "histogram; same measured population, documented, not modeled.")
+        pair("vllm_request_queue_time_seconds", "qse_request_queue_seconds",
+             "Native per-request queue seconds (qse_request_queue_seconds), "
+             "renamed _seconds -> _time_seconds for the adapter.")
+        for dst, srcname in (
+                ("vllm_spec_decode_num_drafts_total", "qse_spec_decode_num_drafts_total"),
+                ("vllm_spec_decode_num_draft_tokens_total", "qse_spec_decode_num_draft_tokens_total"),
+                ("vllm_spec_decode_num_accepted_tokens_total", "qse_spec_decode_num_accepted_tokens_total")):
+            v = tv(srcname)
+            if v is not None:
+                add(dst, str(int(persisted_value("tandem_" + dst, v))),
+                    "counter", f"Renamed from {srcname}.")
+        d = tv("qse_spec_decode_num_draft_tokens_total")
+        a = tv("qse_spec_decode_num_accepted_tokens_total")
+        if d and a is not None:
+            add("tfexporter_tandem_spec_accept_ratio", f"{a / d:.4f}", "gauge",
+                "accepted/draft tokens (lifetime).")
+            add("tfexporter_tandem_first_draft_accept_pct", f"{100.0 * a / d:.2f}", "gauge",
+                "Same ratio as a percentage, for the tile footer.")
+        vc = tv("qse_verify_seconds_count")
+        if vc is not None:
+            # adapter Batch tile: tokens per verify step = gen / verify-rounds
+            gmax = max(gen_fin or 0.0, live)
+            add("vllm_iteration_tokens_total_count",
+                str(int(persisted_value("tandem_iteration_count", vc))), "counter",
+                "Verify rounds (qse_verify_seconds_count): the denominator "
+                "that makes sum/count = tokens per verify step.")
+            add("vllm_iteration_tokens_total_sum",
+                str(int(persisted_value("tandem_iteration_sum", gmax))), "counter",
+                "Generation tokens (same population as vllm_generation_- "
+                "tokens_total) paired with verify rounds for the Batch tile.")
+        ps = tv("qse_request_prefill_tokens_per_second_sum")
+        pc = tv("qse_request_prefill_tokens_per_second_count")
+        if ps and pc:
+            add("tfexporter_tandem_prefill_tps_mean", f"{ps / pc:.1f}", "gauge",
+                "Mean of the engine's measured per-request prefill rate "
+                "(qse_request_prefill_tokens_per_second sum/count).")
+        ds = tv("qse_request_decode_tokens_per_second_sum")
+        dc = tv("qse_request_decode_tokens_per_second_count")
+        if ds and dc:
+            add("tfexporter_tandem_decode_tps_mean", f"{ds / dc:.1f}", "gauge",
+                "Mean of the engine's measured per-request decode rate.")
+        add("tfexporter_tandem_live_decode_tps",
+            f"{getattr(STATE, 'tandem_live_rate', 0.0):.2f}", "gauge",
+            "Tokens/s summed over decoding-phase slots (kv_length growth, "
+            "2s polls, EMA half-life one poll).")
+        rs = getattr(STATE, "tandem", {}) or {}
+        if rs.get("qse_reasoning_tokens_total") is not None:
+            add("tfexporter_tandem_reasoning_tokens_total",
+                str(int(persisted_value("tandem_reasoning_tokens_total",
+                                        rs["qse_reasoning_tokens_total"]))),
+                "counter", "Reasoning tokens (qse_reasoning_tokens_total).")
 
     if schema == "flare-v1":
         pt = getattr(STATE, "flare_prompt_total", None)
@@ -933,6 +1100,62 @@ def engine_live_series(choice):
     return rows
 
 
+def update_tandem_health(now):
+    """TandemLLM: pull /health for the slot view (KV ratio + the live decode
+    window). The engine's generation counter is finished-only (on_request()
+    increments it when the request ends), so the LIVE token feed is the
+    kv_length growth of slots in the decoding phase; vllm_generation_tokens_-
+    total publishes max(finished, live) so short requests that finish between
+    two polls still land."""
+    try:
+        _, body, _ = fetch_upstream("/health")
+        h = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return
+    par = h.get("parallel") or {}
+    slots = par.get("slots") or []
+    n_lanes = par.get("n") or len(slots) or 1
+    max_len = 0.0
+    busy_kv = 0.0
+    dec = {}
+    for i, s in enumerate(slots):
+        ml = s.get("max_len")
+        if ml:
+            max_len = max(max_len, float(ml))
+        kv = s.get("kv_length")
+        if kv:
+            busy_kv += float(kv)
+        # engine's own decoding set (server/slots.py:1367): phase is
+        # "decode"|"runner" while a request is in the block loop. "" means
+        # finished-resident (kv kept for the prefix cache) - must NOT count.
+        if s.get("phase") in ("decode", "runner", "solo") and kv:
+            dec[i] = float(kv)
+    ratio = None
+    if max_len > 0:
+        ratio = min(1.0, busy_kv / (n_lanes * max_len))
+    with STATE.lock:
+        STATE.tandem_health = h
+        STATE.tandem_kv_ratio = ratio
+        # per-slot deltas: a slot SEEDS on its first decoding sample (its
+        # kv_length there is prompt + generated-so-far; counting the jump
+        # would bill prompt tokens as generation), and only later samples
+        # of the same decoding slot contribute positive growth.
+        prev = getattr(STATE, "tandem_prev_dec_kv", None) or {}
+        d = 0.0
+        for i, kv in dec.items():
+            if i in prev:
+                d += max(0.0, kv - prev[i])
+        STATE.tandem_prev_dec_kv = dec
+        if d > 0:
+            STATE.tandem_live_gen = getattr(STATE, "tandem_live_gen", 0.0) + d
+        dt = now - (getattr(STATE, "tandem_prev_ts", None) or now)
+        if dt > 0:
+            inst = max(0.0, d / dt)
+            STATE.tandem_live_rate = (inst if getattr(STATE, "tandem_live_rate", 0.0) <= 0
+                                      else 0.5 * STATE.tandem_live_rate + 0.5 * inst)
+        STATE.tandem_prev_ts = now
+
+
 def update_native_stats(text, now):
     """Schema-aware collector: one trailing window of finished counters with
     per-schema rate sources. Rates are windowed delta ratios (tokens/seconds
@@ -960,6 +1183,52 @@ def update_native_stats(text, now):
         # time minus TTFT time is the honest decode numerator (both are recorded
         # per finished request, so the difference shares the same denominator).
         vals["dec"] = max(0.0, (vals.get("dur") or 0.0) - (vals.get("pf") or 0.0))
+    if STATE.schema == "tandem-v1":
+        # TandemLLM (qwen38-spark-engine). qse_* Prometheus families; family
+        # inventory verified against a live /metrics scrape 2026-11-12 (282
+        # series, 93 families) and the tile audit against the spark-dashboard
+        # binary. The engine separates FRESH prefill (forwarded) from SERVED
+        # prompt and CACHED tokens as its own counters, and publishes real
+        # per-request histograms for TTFT / E2E / TPOT / queue - all lifetime
+        # sums, so pairs pass straight through with exporter-restart offsets.
+        t = {}
+        hits_prefix = 0.0
+        for line in text.splitlines():
+            if line.startswith("qse_"):
+                base = line.split(" ", 1)[0]
+                name = base.split("{", 1)[0]
+                v = _fnum(line)
+                if v is None:
+                    continue
+                if name == "qse_cache_hits_total" and 'kind="prefix"' in base:
+                    hits_prefix += v
+                elif "{" in base:
+                    t[name] = t.get(name, 0.0) + v
+                else:
+                    t[name] = v
+        STATE.tandem = t
+        # FRESH is DEFINED as served - cached, never as qse_prefill_tokens_-
+        # forwarded_total: the forwarded counter includes chunk-boundary
+        # padding on the 4096 grid (measured 2026-11-12: +20 800 tokens over
+        # 43 requests, which pushed queries - prompt negative). Defining
+        # fresh this way makes the adapter identity queries - prompt = hits
+        # exact on every traffic mix. forwarded stays as a diagnostic only.
+        served_v = t.get("qse_prompt_tokens_total")
+        cached_v = t.get("qse_prompt_tokens_cached_total")
+        if cached_v is None:
+            cached_v = hits_prefix
+        if served_v is not None:
+            STATE.tandem_hits = min(cached_v or 0.0, served_v)
+            STATE.tandem_fresh = max(0.0, served_v - STATE.tandem_hits)
+        else:
+            STATE.tandem_hits = None
+            STATE.tandem_fresh = None
+        # prefer the token-level counter; fall back to the prefix kind of
+        # qse_cache_hits_total (chunk lookups) if the engine lacks it
+        STATE.tandem_cache_prefix_hits = t.get("qse_prompt_tokens_cached_total")
+        if STATE.tandem_cache_prefix_hits is None:
+            STATE.tandem_cache_prefix_hits = hits_prefix
+        STATE.tandem_up = t.get("qse_requests_total")
     if STATE.schema == "flare-v1":
         # Flare (Hyperflare) Rust engine. Family inventory verified against a
         # live /metrics scrape 2026-11-12 (docs/api.md "Serving terminal" table).
@@ -1970,6 +2239,8 @@ def poll_loop():
             update_engine_extras(text)
             if native:
                 update_native_stats(text, now)
+                if STATE.schema == "tandem-v1":
+                    update_tandem_health(now)
                 update_models_cache()
                 try:
                     with STATE.lock:
@@ -2250,7 +2521,7 @@ def probe_enabled():
     applies to a TensorFold engine that publishes the same families.
     """
     with STATE.lock:
-        if STATE.schema in ("vllm-v1", "flare-v1"):
+        if STATE.schema in ("vllm-v1", "flare-v1", "tandem-v1"):
             return False
         return not ENGINE_HAS_LATENCY_HIST
 

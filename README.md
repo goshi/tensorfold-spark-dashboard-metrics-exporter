@@ -221,6 +221,38 @@ latency histograms, so the SLO Goodput ITL/TPOT bucket tiles and
 is no per-request measurement to transform, and inventing a modeled
 distribution would be worse than a blank tile.
 
+## Metric mapping (tandem-v1 engine — TandemLLM)
+
+TandemLLM (`qwen38-spark-engine`) publishes a real Prometheus `/metrics` in the
+`qse_*` namespace: genuine per-request histograms for TTFT / E2E / TPOT / queue,
+real spec-decode counters, its own prompt accounting split. Detection marker:
+`qse_requests_running`. Unlike flare-v1 nothing is modeled here — the dashboard
+set is a rename of measured engine series, plus two /health-derived pieces and
+two architectural zeros:
+
+| dashboard family | source | kind |
+| --- | --- | --- |
+| `vllm_time_to_first_token_seconds_{sum,count}` | `qse_time_to_first_token_seconds_*` | renamed, measured |
+| `vllm_e2e_request_latency_seconds_{sum,count}` | `qse_e2e_request_latency_seconds_*` | renamed, measured |
+| `vllm_request_time_per_output_token_seconds_*`, `vllm_time_per_output_token_seconds_*`, `vllm_inter_token_latency_seconds_*` | `qse_time_per_output_token_seconds_*` | one measured population aliased to the three tile names |
+| `vllm_request_queue_time_seconds_{sum,count}` | `qse_request_queue_seconds_*` | renamed, measured |
+| `vllm_prompt_tokens_total` | `qse_prompt_tokens_total − qse_prompt_tokens_cached_total` | FRESH only (forwarded counter carries chunk padding, see CHANGELOG 1.7.0) |
+| `vllm_prefix_cache_queries_total` / `hits_total` | `qse_prompt_tokens_total` / `qse_prompt_tokens_cached_total` (clamped) | identity queries − prompt = hits exact |
+| `vllm_generation_tokens_total` | max(`qse_generation_tokens_total`, Σ per-slot kv growth of decoding lanes) | live hybrid: engine counts only on finish; phases decode\|runner\|solo, per-slot seeding |
+| `vllm_kv_cache_usage_perc` / `gpu_cache_usage_perc` | /health `parallel.slots`: Σ busy kv_length ÷ (QSE_PARALLEL × max_len) | 0..1 ratio |
+| `vllm_spec_decode_num_*` | `qse_spec_decode_num_*` | renamed, measured |
+| `vllm_iteration_tokens_total_{sum,count}` | generation population / `qse_verify_seconds_count` | tokens per verify step for the Batch tile |
+| `vllm_num_requests_swapped`, `vllm_num_preemptions_total` | — | documented zeros: no batching scheduler exists (server/metrics.py) |
+| `tfexporter_tandem_spec_accept_ratio` / `_first_draft_accept_pct` | accepted ÷ draft tokens | derived gauge |
+| `tfexporter_tandem_prefill_tps_mean` / `_decode_tps_mean` | engine histogram sum ÷ count | mean of measured per-request rates |
+| `tfexporter_tandem_live_decode_tps` | kv_length growth window | live gauge (flickers with load, like all live tiles) |
+| `tfexporter_tandem_reasoning_tokens_total` | `qse_reasoning_tokens_total` | renamed counter |
+
+Raw `qse_*` families are served unchanged beside the `vllm_*` set (verified
+zero name collisions), so Grafana can read the engine's own detail — the full
+cache cascade (resident / state store / disk tier), draft-width choice, accept
+per speculation depth. Synthetic probes are disabled for this schema.
+
 ## Live rates: engine first, ours as fallback
 
 The engine publishes a `live` object in `/health`:

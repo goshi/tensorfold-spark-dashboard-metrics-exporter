@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.7.0 - 2026-11-12
+- tandem-v1: schema for TandemLLM (qwen38-spark-engine). The engine publishes a
+  real Prometheus /metrics in the `qse_*` namespace with genuine per-request
+  histograms (TTFT / E2E / TPOT / queue), real spec-decode counters and its own
+  fresh/served/cached prompt split, so the dashboard set is a near-1:1 rename -
+  no synthesized integrals this time. Auto-detection marker: `qse_requests_running`.
+  Raw `qse_*` families pass through untouched (verified zero collisions with the
+  emitted vllm_*/tfexporter_* names).
+- tandem-v1 FRESH prompt: defined as `qse_prompt_tokens_total -
+  qse_prompt_tokens_cached_total`, NOT `qse_prefill_tokens_forwarded_total` -
+  the forwarded counter carries 4096-grid chunk padding (measured +20 800
+  tokens / 43 requests) and pushes the adapter identity queries - prompt = hits
+  negative. Prefill Per-Req cross-check after fix: 927 t/s vs the engine's own
+  measured per-request prefill mean 932.7 t/s.
+- tandem-v1 LIVE generation: the engine increments `qse_generation_tokens_total`
+  only per finished request (`on_request()`), so the Live decode tile would sit
+  at zero mid-generation - the same class of bug the tensorfold health-completion
+  source fixed. The exporter accumulates kv_length growth of decoding slots
+  (phases decode|runner|solo per server/app.py; per-slot seeding so a prompt's
+  first decoding sample is never billed as generation) and emits
+  max(finished, live). `tfexporter_tandem_live_decode_tps` exposes the window rate.
+- tandem-v1 KV ratio: `sum(slots[].kv_length of busy slots) / (QSE_PARALLEL x
+  max_len)` from /health parallel.slots - 0..1 house semantics, both
+  kv_cache_usage_perc and gpu_cache_usage_perc twins.
+- tandem-v1 documented zeros: num_requests_swapped / num_preemptions_total are
+  architectural, not gaps - server/metrics.py: "no preemption to report; those
+  metrics belong to a batching scheduler and this server has none" (8 independent
+  lanes).
+- tandem-v1 probes disabled (deny list): the engine measures its own latency
+  population; synthetic load would pollute it.
+- tandem-v1 diagnostics: spec accept ratio/pct, engine-measured prefill/decode
+  tps means (histogram sum/count), live decode tps, reasoning tokens.
+
 ## 1.6.2 - 2026-11-12
 - flare-v1: Prefill Per-Req Avg sanity. The adapter derives all Prefill tiles
   from `vllm_prompt_tokens_total` combined with the ttft sum; feeding it
