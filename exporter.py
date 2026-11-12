@@ -92,7 +92,7 @@ PREFIXES = ("tensorfold_health:", "tensorfold:", "velogb10_")
 # Native vLLM exposition namespace (colon-separated). Spark Dashboard's
 # VllmAdapter matches UNDERSCORE names, so these are renamed 1:1.
 VLLM_PREFIX = "vllm:"
-VERSION = "1.5.5"
+VERSION = "1.6.2"
 
 # How long an engine /health "live" reading stays believable. The engine keeps its own
 # 2 s sliding window (core/lane_host.zig: tokens over window_ns, divided by 2.0), so a
@@ -339,6 +339,19 @@ SCHEMA_SOURCES = {
     # recorded at request completion) minus pf (time_to_first_token_seconds_sum,
     # recorded at first token) is the honest decode-seconds numerator, applied
     # in update_native_stats' velo branch.
+    # Flare has no request-seconds counters at all: "dec" is filled by the
+    # flare branch with the exporter-measured occupancy integral (time-integral
+    # of flare_active_requests on the polling timeline), so rate_decode reads
+    # tokens per second PER ACTIVE REQUEST (documented in HELP, not measured
+    # per-request seconds). "pf" stays 0: no prefill-seconds source exists, so
+    # rate_prefill is honestly 0 and prefill tiles use the counter deltas.
+    "flare-v1": {
+        "gen": ("flare_generated_tokens_total",),
+        "dec": (),
+        "prompt": ("flare_prompt_tokens_synthetic",),
+        "pf": ("flare_prefill_seconds_synthetic",),
+        "run": ("flare_active_requests",),
+    },
     "velo-v1": {
         "gen": ("velogb10_generation_tokens_total",),
         "dec": (),
@@ -359,6 +372,10 @@ def detect_schema(text):
     python-v1: colon families (tensorfold:*) from the Python engine
     velo-v1:   the veloGB10 EXL3 engine (`velogb10_prompt_tokens_total`,
                TP=1 single-GB10 Qwen3.8/DeepSeek builds)
+    flare-v1:  the Flare (Hyperflare) Rust engine (`flare_prefill_tokens_total`,
+               TP=1/2 NVFP4 builds); all vllm_* families come from the
+               engine_native_series flare branch because Flare's family names
+               share no suffix with the vLLM namespace
     unknown:   nothing recognised
     """
     if "vllm:prompt_tokens_total" in text or "vllm:generation_tokens_total" in text:
@@ -369,6 +386,8 @@ def detect_schema(text):
         return "python-v1"
     if "velogb10_prompt_tokens_total" in text:
         return "velo-v1"
+    if "flare_prefill_tokens_total" in text:
+        return "flare-v1"
     return "unknown"
 
 
@@ -435,6 +454,183 @@ def engine_native_series(existing_names):
             return
         rows.append((name, value, kind, doc))
 
+    if schema == "flare-v1":
+        pt = getattr(STATE, "flare_prompt_total", None)
+        pt0 = getattr(STATE, "flare_e_prompt0", None)
+        gt = getattr(STATE, "flare_gen_total", None)
+        if pt is not None and pt0 is not None:
+            pt = pt - pt0  # era population (same window as the ttft sum)
+        if pt is not None:
+            add("vllm_prompt_tokens_total", str(int(persisted_value("flare_prompt_tokens_total", pt))),
+                "counter",
+                "FRESH prompt tokens only (flare_prefill_tokens_total): the "
+                "engine excludes prefix-reused tokens from prefill work, and "
+                "the dashboard derives Prefill Live/Avg/Per-Req from this "
+                "counter as COMPUTE throughput - counting reused tokens there "
+                "inflates it by the cache-hit share. Lifetime population.")
+        if gt is not None:
+            add("vllm_generation_tokens_total", str(int(persisted_value("flare_generation_tokens_total", gt))),
+                "counter",
+                "Committed generated tokens (flare_generated_tokens_total, "
+                "including EOS and stop-withheld tokens per docs/api.md).")
+        run = getattr(STATE, "flare_running", None)
+        if run is not None:
+            add("vllm_num_requests_running", str(int(run)), "gauge",
+                "Model slots with a live request (flare_active_requests).")
+        wait = getattr(STATE, "flare_waiting", None)
+        if wait is not None:
+            add("vllm_num_requests_waiting", str(int(wait)), "gauge",
+                "Requests waiting in the scheduler (flare_pending_requests).")
+        add("vllm_num_requests_swapped", "0", "counter",
+            "Documented zero: Flare does not preempt to host KV (preemptions "
+            "are counted separately as tfexporter_flare_preemptions_total).")
+        kr = getattr(STATE, "flare_kv_ratio", None)
+        if kr is not None:
+            add("vllm_kv_cache_usage_perc", f"{kr:.4f}", "gauge",
+                "KV pool usage as a 0..1 ratio (house semantics, tile "
+                "multiplies by 100): (flare_total_kv_tokens - "
+                "flare_free_kv_tokens) / flare_total_kv_tokens.")
+        rz = getattr(STATE, "flare_reused", None)
+        rz0 = getattr(STATE, "flare_e_reused0", None)
+        if rz is not None and rz0 is not None:
+            rz = rz - rz0
+        if rz is not None:
+            add("vllm_prefix_cache_hits_total", str(int(persisted_value("flare_prefix_cache_hits_total", rz))),
+                "counter",
+                "GPU prefix-cache hits in TOKENS (flare_cache_reused_tokens_"
+                "total), same unit convention as the velo profile's hits.")
+        sv = getattr(STATE, "flare_prompt_served", None)
+        sv0 = getattr(STATE, "flare_e_served0", None)
+        if sv is not None and sv0 is not None:
+            sv = sv - sv0
+        if sv is not None:
+            add("vllm_prefix_cache_queries_total", str(int(persisted_value("flare_prefix_cache_queries_total", sv))),
+                "counter",
+                "SERVED prompt tokens (fresh prefill + prefix-reused) as the "
+                "queries denominator; hit% = reused / served. Deliberately "
+                "larger than vllm_prompt_tokens_total (compute-only).")
+        med = getattr(STATE, "flare_ttft_med", None)
+        ti = getattr(STATE, "flare_e_ttft_int", None)
+        d0 = getattr(STATE, "flare_e_done0", None)
+        dc = getattr(STATE, "flare_completed", None)
+        if ti is not None and d0 is not None and dc is not None and dc > d0:
+            done = dc - d0
+            add("vllm_time_to_first_token_seconds_sum", "%.6f" % persisted_value("flare_ttft_int", ti), "counter",
+                "ENGINE-SCALE estimator: Flare publishes only a rolling-window "
+                "median TTFT (flare_first_response_median_seconds over "
+                "window_seconds). sum = window median x lifetime completed "
+                "requests, so mean_ms(sum,count) = current window median while "
+                "count is the true request total the dashboard shows; the "
+                "Prefill Per-Req tile (prompt_total/sum) becomes "
+                "mean-prompt-length / window-median-TTFT. The raw per-window "
+                "median and its sample/truncation gauges are surfaced as "
+                "tfexporter_flare_first_response_*. sum/count = weighted mean "
+                "TTFT over the exporter era; prompt_tokens_total is baselined "
+                "to the SAME era so the fixed Prefill Per-Req formula reads a "
+                "population-consistent rate.")
+            add("vllm_time_to_first_token_seconds_count", str(int(done)), "counter",
+                "Completed requests over the same era as the sum "
+                "(flare_requests_completed_total minus its attach baseline).")
+        ai = getattr(STATE, "flare_a_int_last", None)
+        g0 = getattr(STATE, "flare_a_gen0", None)
+        if ai is not None and gt is not None and g0 is not None and gt >= g0:
+            # Population-consistent window: request-seconds and tokens both
+            # measured since the integral era opened (exporter attach /
+            # engine restart); each side persists its own offset so an
+            # exporter restart shifts both and the ratio stays continuous.
+            ai_p = persisted_value("flare_active_integral", ai)
+            tok_p = persisted_value("flare_tpot_tokens", gt - g0)
+            add("vllm_request_time_per_output_token_seconds_sum", "%.3f" % ai_p, "counter",
+                "DERIVED, not per-request measured: integral of "
+                "flare_active_requests dt on the exporter polling timeline "
+                "(request-seconds in the engine), opened at exporter attach.")
+            add("vllm_request_time_per_output_token_seconds_count", str(int(tok_p)), "counter",
+                "Completion tokens over the SAME window as the integral "
+                "(flare_generated_tokens_total minus its attach baseline), "
+                "so mean_ms(sum,count) = mean TPOT across active requests.")
+            add("vllm_inter_token_latency_seconds_sum", "%.3f" % ai_p, "counter",
+                "ITL alias of the occupancy-derived TPOT pair above (same "
+                "seconds/token population; stated, not fabricated).")
+            add("vllm_inter_token_latency_seconds_count", str(int(tok_p)), "counter",
+                "Token intervals (completion tokens) over the same window.")
+        qi = getattr(STATE, "flare_q_int", None)
+        qb = getattr(STATE, "flare_q_base", None)
+        qd = getattr(STATE, "flare_q_done", None)
+        if qi is not None and qb is not None and qd is not None and qd > qb:
+            add("vllm_request_queue_time_seconds_sum", "%.1f" % persisted_value("flare_queue_integral", qi), "counter",
+                "Little's-law estimate (Flare has no queue-seconds counter): "
+                "trapezoidal integral of flare_pending_requests over the "
+                "exporter 2 s polling timeline, rebased on engine restart.")
+            add("vllm_request_queue_time_seconds_count", str(int(qd - qb)), "counter",
+                "Requests completed in the same window as the queue integral.")
+        steps = getattr(STATE, "flare_steps", None)
+        if steps and gt is not None:
+            add("vllm_iteration_tokens_total_sum", str(int(persisted_value("flare_iteration_tokens_sum", gt))), "counter",
+                "Sum = completion tokens; count = scheduler executions "
+                "(sum of flare_scheduler_executions_total over reason labels). "
+                "sum/count = tokens per step = effective decode batch.")
+            add("vllm_iteration_tokens_total_count", str(int(persisted_value("flare_iteration_count", steps))), "counter",
+                "Physical scheduler executions (docs/api.md scheduler table).")
+        off = getattr(STATE, "flare_off", None)
+        acc = getattr(STATE, "flare_acc", None)
+        if off is not None:
+            add("vllm_spec_decode_num_draft_tokens_total", str(int(persisted_value("flare_spec_offered", off))), "counter",
+                "Speculative draft positions offered (flare_speculative_"
+                "offered_drafts_total).")
+        if acc is not None:
+            add("vllm_spec_decode_num_accepted_tokens_total", str(int(persisted_value("flare_spec_accepted", acc))), "counter",
+                "Accepted draft tokens (flare_speculative_accepted_drafts_"
+                "total, excluding bonus token).")
+        vd = getattr(STATE, "flare_ver_drafts", None)
+        vr = getattr(STATE, "flare_ver_rounds", None)
+        if vd is not None and vr:
+            add("tfexporter_flare_verification_depth", "%.2f" % (vd / vr), "gauge",
+                "Mean draft-prefix length per progressing round: "
+                "flare_verification_draft_tokens_total / "
+                "flare_verification_request_rounds_total (docs/api.md DEPTH).")
+        ar = getattr(STATE, "flare_accept_ratio", None)
+        if ar is not None:
+            add("tfexporter_flare_spec_accept_ratio", f"{ar:.4f}", "gauge",
+                "accepted/offered draft tokens (lifetime since engine start).")
+        pre = getattr(STATE, "flare_preempt", None)
+        if pre is not None:
+            pre_p = persisted_value("flare_preemptions_total", pre)
+            add("vllm_num_preemptions_total", str(int(pre_p)), "counter",
+                "Requests preempted by the scheduler (flare_preemptions_total), "
+                "under the name the VllmAdapter reads.")
+            add("tfexporter_flare_preemptions_total", str(int(pre_p)), "counter",
+                "Same series, tfexporter-namespaced twin.")
+        rounds = getattr(STATE, "flare_rounds", None)
+        if rounds is not None:
+            add("vllm_spec_decode_num_drafts_total", str(int(persisted_value("flare_spec_rounds", rounds))), "counter",
+                "Speculative verification rounds (flare_speculative_rounds_"
+                "total summed over batch/width labels). Mean acceptance length "
+                "= accepted / this; plausibility gate: Batch tile ~= this "
+                "ratio + 1 (MTP).")
+        if med is not None:
+            add("tfexporter_flare_first_response_median_seconds", f"{med:.6f}", "gauge",
+                "Engine's own rolling-window TTFT median, raw.")
+        ns = getattr(STATE, "flare_ttft_n", None)
+        if ns is not None:
+            add("tfexporter_flare_first_response_samples", str(int(ns)), "gauge",
+                "Samples inside the current first-response window; median is "
+                "trustworthy when this is healthy and truncated == 0.")
+        kr2 = getattr(STATE, "flare_kv_ratio", None)
+        if kr2 is not None:
+            add("vllm_gpu_cache_usage_perc", f"{kr2:.4f}", "gauge",
+                "Twin of vllm_kv_cache_usage_perc (the adapter reads either).")
+        trunc = getattr(STATE, "flare_ttft_trunc", None)
+        if trunc is not None:
+            add("tfexporter_flare_first_response_truncated", str(int(trunc)), "gauge",
+                "Samples truncated at window end (0 = trustworthy median).")
+        gl = getattr(STATE, "flare_gen_last_min", None)
+        if gl is not None:
+            add("tfexporter_flare_generated_tokens_last_minute", str(int(gl)), "gauge",
+                "Engine-reported generated tokens in the last 60 s (native live rate).")
+        fs = getattr(STATE, "flare_free_slots", None)
+        if fs is not None:
+            add("tfexporter_flare_free_request_slots", str(int(fs)), "gauge",
+                "Free model slots (flare_free_request_slots).")
     if schema == "velo-v1":
         ts = getattr(STATE, "velo_tpot_sum", None)
         tc = getattr(STATE, "velo_tpot_count", None)
@@ -764,6 +960,154 @@ def update_native_stats(text, now):
         # time minus TTFT time is the honest decode numerator (both are recorded
         # per finished request, so the difference shares the same denominator).
         vals["dec"] = max(0.0, (vals.get("dur") or 0.0) - (vals.get("pf") or 0.0))
+    if STATE.schema == "flare-v1":
+        # Flare (Hyperflare) Rust engine. Family inventory verified against a
+        # live /metrics scrape 2026-11-12 (docs/api.md "Serving terminal" table).
+        # No per-request seconds exist anywhere on this engine: TPOT/ITL and the
+        # decode rate ride on the occupancy integral below, queue time on
+        # Little's law - both documented in their HELP, neither invented.
+        f = {}
+        sched_sum = None
+        for line in text.splitlines():
+            if line.startswith("flare_"):
+                base = line.split(" ", 1)[0]
+                name = base.split("{", 1)[0]
+                v = _fnum(line)
+                if v is None:
+                    continue
+                if name == "flare_scheduler_executions_total":
+                    sched_sum = (sched_sum or 0.0) + v
+                elif "{" in base:
+                    # labeled family: sum across labels (rounds by batch/width, ...)
+                    f[name] = f.get(name, 0.0) + v
+                else:
+                    # unlabeled: LAST match wins (fixture/dup hygiene)
+                    f[name] = v
+        gen_v = f.get("flare_generated_tokens_total")
+        prefill = f.get("flare_prefill_tokens_total") or 0.0
+        reused = f.get("flare_cache_reused_tokens_total") or 0.0
+        # vLLM prompt_tokens semantics include prefix-reused tokens: served
+        # prompt = fresh prefill + reused. (rate_prefill stays 0: no
+        # prefill-seconds source; prompt tiles are counter-driven.)
+        vals["prompt"] = prefill + reused
+        cached_v = reused if reused else None
+        up = f.get("flare_uptime_seconds")
+        active = f.get("flare_active_requests")
+        # hoisted: era init and the TTFT accumulator both need it
+        done = f.get("flare_requests_completed_total")
+        with STATE.lock:
+            if cached_v is not None:
+                STATE.last_cached = cached_v
+            # Occupancy integral (trapezoidal over the 2 s polling timeline):
+            # integral of active-requests dt = request-seconds spent in the
+            # engine. Monotonic within an engine era; rebased on restart.
+            if active is not None and gen_v is not None:
+                if getattr(STATE, "flare_a_t", None) is None or up is not None and                         getattr(STATE, "flare_a_up", None) is not None and up < STATE.flare_a_up:
+                    STATE.flare_a_int = 0.0
+                    STATE.flare_a_t = now
+                    STATE.flare_a_a = active
+                    STATE.flare_a_up = up
+                    # same era baseline for the token side of the TPOT pair:
+                    # sum and count must cover the SAME window or
+                    # mean_ms(sum,count) divides an attach-time integral by
+                    # lifetime tokens (v1.6.1 audit caught 8401 t/s nonsense)
+                    STATE.flare_a_gen0 = gen_v
+                    # ...and for the Prefill Per-Req pair (v1.6.2 audit: the
+                    # adapter's fixed formula prompt_total/ttft_sum mixed a
+                    # lifetime numerator with a current-window denominator:
+                    # 6355 t/s during tool-eval against a measured 2.3k cold
+                    # plateau). All prefill-side counters baseline together.
+                    STATE.flare_e_prompt0 = prefill or 0.0
+                    STATE.flare_e_served0 = vals.get("prompt") or 0.0
+                    STATE.flare_e_reused0 = reused
+                    STATE.flare_e_done0 = done
+                    STATE.flare_e_done_last = done
+                    STATE.flare_e_ttft_int = 0.0
+                else:
+                    dt_a = now - STATE.flare_a_t
+                    if 0 < dt_a < 300:
+                        STATE.flare_a_int += (STATE.flare_a_a + active) * 0.5 * dt_a
+                    STATE.flare_a_t = now
+                    STATE.flare_a_a = active
+                STATE.flare_a_int_last = STATE.flare_a_int
+            vals["dec"] = getattr(STATE, "flare_a_int_last", 0.0)
+            # Little's-law queue integral (same discipline as velo v1.5.5):
+            # waiting-seconds / completions over the same polling window.
+            pend = f.get("flare_pending_requests")
+            done = f.get("flare_requests_completed_total")
+            if pend is not None and done is not None:
+                if getattr(STATE, "flare_q_t", None) is None or done < (STATE.flare_q_base or 0):
+                    STATE.flare_q_int = 0.0
+                    STATE.flare_q_t = now
+                    STATE.flare_q_w = pend
+                    STATE.flare_q_base = done
+                else:
+                    dt_q = now - STATE.flare_q_t
+                    if 0 < dt_q < 300:
+                        STATE.flare_q_int += (STATE.flare_q_w + pend) * 0.5 * dt_q
+                    STATE.flare_q_t = now
+                    STATE.flare_q_w = pend
+                STATE.flare_q_done = done
+            if getattr(STATE, "flare_e_done_last", None) is not None and done is not None:
+                med_now = f.get("flare_first_response_median_seconds")
+                dn = done - STATE.flare_e_done_last
+                if dn > 0 and med_now is not None:
+                    # true sum of per-request TTFTs approximated with the
+                    # engine's window median at the moment of completion
+                    STATE.flare_e_ttft_int += dn * med_now
+                    STATE.flare_e_done_last = done
+                elif dn > 0 and med_now is None:
+                    pass  # hold: absorbed by the next poll, never invented
+            STATE.flare_preempt = f.get("flare_preemptions_total")
+            STATE.flare_failed = f.get("flare_requests_failed_total")
+            STATE.flare_cancelled = f.get("flare_requests_cancelled_total")
+            STATE.flare_waiting = pend
+            STATE.flare_running = active
+            tot = f.get("flare_total_kv_tokens")
+            free = f.get("flare_free_kv_tokens")
+            if tot and free is not None and tot > 0:
+                STATE.flare_kv_ratio = max(0.0, min(1.0, (tot - free) / tot))
+                STATE.flare_kv_used = tot - free
+                STATE.flare_kv_total = tot
+            STATE.flare_completed = f.get("flare_requests_completed_total")
+            STATE.flare_rounds = f.get("flare_speculative_rounds_total")
+            STATE.flare_ttft_med = f.get("flare_first_response_median_seconds")
+            STATE.flare_ttft_n = f.get("flare_first_response_samples")
+            STATE.flare_ttft_win = f.get("flare_first_response_window_seconds")
+            STATE.flare_ttft_trunc = f.get("flare_first_response_truncated")
+            if sched_sum is not None:
+                STATE.flare_steps = sched_sum
+            STATE.flare_ver_drafts = f.get("flare_verification_draft_tokens_total")
+            STATE.flare_ver_rounds = f.get("flare_verification_request_rounds_total")
+            STATE.flare_acc = f.get("flare_speculative_accepted_drafts_total")
+            STATE.flare_off = f.get("flare_speculative_offered_drafts_total")
+            STATE.flare_free_slots = f.get("flare_free_request_slots")
+            STATE.flare_cache_hits = f.get("flare_cache_hits_total")
+            STATE.flare_cache_lookups = f.get("flare_cache_lookups_total")
+            STATE.flare_gen_last_min = f.get("flare_generated_tokens_last_minute")
+            if STATE.flare_acc is not None and STATE.flare_off:
+                STATE.flare_accept_ratio = STATE.flare_acc / STATE.flare_off
+            if up is not None:
+                if STATE.prev_uptime is not None and up < STATE.prev_uptime:
+                    STATE.restarts += 1
+                    STATE.offsets = {}
+                    STATE.probe_hist = {}
+                    STATE.probe = {"ttft": [0.0, 0], "e2e": [0.0, 0], "itl": [0.0, 0]}
+                    STATE.rate_prefill_hold = None
+                    STATE.flare_a_t = None       # integrals are era-bound too
+                    STATE.flare_q_t = None
+                STATE.prev_uptime = up
+            # Tile-semantics split (v1.6.2): the dashboard's Prefill tiles
+            # (Live/Avg = delta of prompt_tokens_total; Per-Req = prompt_total
+            # / ttft_sum) measure COMPUTE, so the numerator must exclude
+            # prefix-reused tokens - they cost no prefill time and inflated
+            # Per-Req to 6.9k+ t/s against a measured 2.3k plateau. Served
+            # (fresh+reused) stays only as the cache-queries denominator.
+            STATE.flare_prompt_total = prefill if prefill else 0.0
+            STATE.flare_prompt_served = vals.get("prompt")
+            STATE.flare_gen_total = gen_v
+            STATE.flare_reused = reused
+            STATE.last_inflight = int(active or 0)
     dec = vals.get("dec") or 0.0
     prompt = vals.get("prompt") or 0.0
     pf = vals.get("pf") or 0.0
@@ -917,7 +1261,7 @@ def update_native_stats(text, now):
                 STATE.rate_decode = 0.0
                 STATE.rate_prefill = 0.0
         cached_wv = (STATE.last_cached
-                     if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1") else None)
+                     if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1", "flare-v1") else None)
         STATE.window.append((now, gen, dec, prompt, pf, cached_wv))
         cutoff = now - RATE_WINDOW_S
         while STATE.window and STATE.window[0][0] < cutoff:
@@ -944,7 +1288,7 @@ def update_native_stats(text, now):
                     STATE.rate_prefill = max(0.0, d_prompt - d_cached) / d_pf
                     if STATE.rate_prefill > 0:
                         STATE.rate_prefill_hold = STATE.rate_prefill
-    if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1"):
+    if STATE.schema in ("zig-v1", "vllm-v1", "velo-v1", "flare-v1"):
         with STATE.lock:
             cached_now = STATE.last_cached
             if (cached_now is not None and STATE.prev_cached is not None
@@ -1906,7 +2250,7 @@ def probe_enabled():
     applies to a TensorFold engine that publishes the same families.
     """
     with STATE.lock:
-        if STATE.schema == "vllm-v1":
+        if STATE.schema in ("vllm-v1", "flare-v1"):
             return False
         return not ENGINE_HAS_LATENCY_HIST
 

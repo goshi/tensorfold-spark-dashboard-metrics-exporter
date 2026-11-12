@@ -56,6 +56,9 @@ dashboard shows `--` rather than a made-up number.
 - **`velo-v1`** — `velogb10_prompt_tokens_total` present: the veloGB10 GB10
   engine (EXL3 packs, MTP spec-decode, per-lane KV pre-allocation). See
   "Metric mapping (velo-v1 engine)" below.
+- **`flare-v1`** — `flare_prefill_tokens_total` present: the Flare (Hyperflare)
+  Rust engine (NVFP4 cores, b12x loader, draft-spec decode). See
+  "Metric mapping (flare-v1 engine)" below.
 - **`zig-v1`** — underscore families (`tensorfold_prompt_tokens_total{model=…}`),
   the flash17 Zig engine. Primary target: raw families + `/health` JSON
   (in-flight, spec-decode counters, streams).
@@ -185,6 +188,38 @@ Functional gap kept honest: veloGB10 never emits per-request queue seconds,
 so Queue is a poll-sampled estimate (documented in HELP), not an engine
 measurement. The engine counts decode rounds as
 `velogb10_spec_rounds_total`; it is surfaced natively.
+
+## Metric mapping (flare-v1 engine — Flare / Hyperflare)
+
+Flare (Rust, `flare_*` families only, no `/health` block beyond
+`{"status":"ok"}`) shares no family-name suffix with the vLLM namespace, so
+the whole dashboard set is synthesized in the `engine_native_series`
+flare branch. Sources verified against a live scrape and the engine's own
+`docs/api.md` serving-terminal table (2026-11-12 build):
+
+| Emitted | Source | Honest caveat |
+|---|---|---|
+| `vllm_prompt_tokens_total` | `flare_prefill_tokens_total + flare_cache_reused_tokens_total` | vLLM semantics: prompt totals include prefix-reused tokens |
+| `vllm_generation_tokens_total` | `flare_generated_tokens_total` | direct rename |
+| `vllm_num_requests_running` / `_waiting` | `flare_active_requests` / `flare_pending_requests` | direct rename |
+| `vllm_num_requests_swapped` | constant 0 | documented zero: Flare counts preemptions, not host-KV swap-outs (`tfexporter_flare_preemptions_total`) |
+| `vllm_kv_cache_usage_perc` | `(total_kv_tokens − free_kv_tokens) / total_kv_tokens` | **ratio 0..1** — the dashboard multiplies by 100 |
+| `vllm_prefix_cache_hits_total` / `_queries_total` | `flare_cache_reused_tokens_total` / prompt total | token units, same convention as velo-v1 |
+| `vllm_time_to_first_token_seconds_sum`/`_count` | `flare_first_response_median_seconds × samples` / `samples` | **gauge-shaped**: the engine publishes a 600 s rolling median, not a cumulative histogram; sum/count = current window median, `tfexporter_flare_first_response_truncated` marks window-edge truncation |
+| `vllm_request_time_per_output_token_seconds*`, `vllm_inter_token_latency_seconds*` | time-integral of `flare_active_requests` dt ÷ completion tokens | **occupancy-derived**: Flare has no per-request seconds anywhere; sum/count = mean TPOT across active requests (state on client totals, not fabricated samples) |
+| `vllm_request_queue_time_seconds_sum`/`_count` | time-integral of `flare_pending_requests` dt ÷ window completions | **Little's law** over the exporter's 2 s poll timeline (same discipline as velo-v1 in 1.5.5) |
+| `vllm_iteration_tokens_total_sum`/`_count` (Batch tile) | completion tokens ÷ `flare_scheduler_executions_total` (reason labels summed) | tokens per physical step (docs/api.md batch table) |
+| `vllm_spec_decode_num_draft_tokens_total` / `_accepted_` | `flare_speculative_offered/accepted_drafts_total` | direct rename |
+| `tfexporter_flare_verification_depth` | `flare_verification_draft_tokens_total / flare_verification_request_rounds_total` | docs/api.md DEPTH definition |
+| `tfexporter_flare_spec_accept_ratio` | accepted/offered drafts | lifetime ratio |
+| `tfexporter_flare_generated_tokens_last_minute` | native engine gauge | engine's own live decode rate |
+| `tfexporter_flare_free_request_slots` | `flare_free_request_slots` | direct |
+
+Functional gaps kept honest: Flare publishes **no** per-token or per-request
+latency histograms, so the SLO Goodput ITL/TPOT bucket tiles and
+`vllm_e2e_request_latency_seconds*` stay empty — unlike velo-v1 (1.5.5) there
+is no per-request measurement to transform, and inventing a modeled
+distribution would be worse than a blank tile.
 
 ## Live rates: engine first, ours as fallback
 

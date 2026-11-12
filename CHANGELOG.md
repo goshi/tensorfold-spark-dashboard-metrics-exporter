@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.6.2 - 2026-11-12
+- flare-v1: Prefill Per-Req Avg sanity. The adapter derives all Prefill tiles
+  from `vllm_prompt_tokens_total` combined with the ttft sum; feeding it
+  SERVED prompt tokens (fresh + prefix-reused) priced zero-cost reused tokens
+  at prefill speed (tile showed 6.9k+ t/s vs the measured 2.3k cold plateau,
+  tens of thousands when the TTFT window went warm). `prompt_tokens_total`
+  now carries FRESH prefill only; `prefix_cache_queries_total` keeps SERVED
+  as the hit-rate denominator. Cross-check after fix: fresh-per-request over
+  the ttft sum sits in the same family as the cold-sweep plateau, and hit%
+  unchanged (hits/queries both served-scale).
+- flare-v1: population consistency for the WHOLE prefill side. The adapter's
+  fixed formula divides `vllm_prompt_tokens_total` by the ttft sum, but the
+  numerator was lifetime while the denominator tracked the current TTFT
+  window: during tool-eval the tile read 6355 t/s against the measured
+  2250-2333 t/s cold plateau (stale 260k-token prompts divided by a 0.49 s
+  warm median). Now the exporter opens a prefill era at attach: prompt/
+  queries/hits are baselined to era start, and the ttft sum ACCUMULATES
+  `dn x current window median` per poll - an estimator of the true sum of
+  per-request TTFTs. sum/count = weighted mean TTFT; Per-Req = mean fresh
+  prompt / mean TTFT over the same population. Polls with no median hold
+  the accumulator (nothing invented); the era rebases on engine restart and
+  both sides persist across exporter restarts.
+
+## 1.6.1 - 2026-11-12
+- flare-v1 tile audit against the VllmAdapter binary inventory
+  (`strings /usr/local/bin/spark-dashboard`): every series the adapter reads
+  is now emitted or a documented blank. Fixes found by the audit:
+  - TTFT pair switched to ENGINE scale (sum = window median x lifetime
+    completed, count = completed_total): the old gauge-shaped window pair fed
+    the dashboard's total_requests (showed window samples), Prefill Per-Req
+    (prompt_total/ttft_sum -> absurd) and TTFT tiles. Raw window median,
+    samples and truncation stay as tfexporter_flare_first_response_* gauges.
+  - Added `vllm_num_preemptions_total` (adapter name; the tfexporter_ twin
+    stays) and `vllm_spec_decode_num_drafts_total` (Mean acceptance length
+    divides accepted by this exact name).
+  - TPOT/ITL pair made population-consistent: sum (attach-opened occupancy
+    integral) and count now cover the SAME window (tokens minus the era
+    token baseline). The audit caught lifetime-count/attach-window mixing
+    that rendered Decode Per-Req as 8401 t/s; post-fix cross-check vs the
+    engine's own last-minute rate: 38.9 vs 42.2 t/s (4%).
+  - Emitted vllm_gpu_cache_usage_perc as a twin of the KV ratio (adapter
+    reads either name).
+  - No E2E tile exists in the binary - nothing fabricated for it.
+- Tests: TTFT pair assertions now engine-scale; +3 adapter-name asserts. 99 OK.
+
+## 1.6.0 - 2026-11-12
+- New schema **flare-v1** (Flare/Hyperflare Rust engine, detected via
+  `flare_prefill_tokens_total`). Flare's 437-series `flare_*` namespace shares
+  no suffix with vLLM, so the dashboard set is synthesized wholesale in a
+  schema-gated engine_native_series branch: prompt totals (prefill+reused),
+  generation, running/waiting, KV usage as a ratio, prefix hits/queries in
+  tokens, TTFT from the engine's own 600 s rolling median (gauge-shaped pair,
+  truncated flag surfaced), TPOT/ITL from the occupancy integral
+  (integral of flare_active_requests dt - the engine publishes no
+  per-request seconds), queue via Little's law on flare_pending_requests,
+  Batch = tokens per scheduler execution, spec acceptance + docs-defined
+  verification depth, native last-minute decode rate. Synthetic probes are
+  disabled for flare-v1 (the engine already measures first response).
+  SLO ITL/TPOT buckets and e2e latency stay empty: no source exists and no
+  distribution is invented.
+- Tests: +5 (tests/test_flare_schema.py: detection, collection with both
+  integrals, full emitted-family set on hand-computed numbers, era reset,
+  exporter-restart monotonicity). 99 OK.
+
 ## 1.5.5 - 2026-11-11
 - velo-v1: SLO Goodput buckets for ITL/TPOT tiles. The engine publishes a
   per-request decode-rate histogram (velogb10_decode_tokens_per_second_bucket);
